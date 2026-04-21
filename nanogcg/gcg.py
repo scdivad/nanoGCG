@@ -428,38 +428,47 @@ class GCG:
                 n_needed = config.buffer_size - 1
                 n_optim_ids = init_optim_ids.shape[1]
                 if config.filter_ids:
-                    # Oversample random INIT_CHARS sequences and drop any that
-                    # don't survive decode/re-encode round-trip. Tokenizers
-                    # with aggressive BPE merging (e.g. Llama 3) often merge
-                    # random-punctuation token sequences differently when
-                    # re-tokenized as a concatenated string — if those
-                    # entries are admitted to the buffer, any later
-                    # `filter_ids` pass during the main loop can wipe out
-                    # every candidate sampled from them and crash the run.
+                    # Generate buffer entries by perturbing the user's init at
+                    # a small random subset of positions with random INIT_CHARS
+                    # tokens. Purely-random INIT_CHARS sequences essentially
+                    # never survive decode/re-encode round-trip on Llama 3's
+                    # BPE (empirically 0%); perturbing the user init preserves
+                    # its spacing structure and round-trips ~35% of the time,
+                    # so oversampling gets us enough valid entries. Oversample
+                    # and drop ones that fail round-trip.
+                    n_perturb = max(1, n_optim_ids // 4)
                     oversample_factor = 8
                     max_attempts = 4
                     valid_random = init_optim_ids.new_empty((0, n_optim_ids))
                     for _ in range(max_attempts):
                         if valid_random.shape[0] >= n_needed:
                             break
-                        init_indices = torch.randint(
-                            0, init_buffer_chars.shape[0],
-                            (n_needed * oversample_factor, n_optim_ids),
-                        )
-                        candidates = init_buffer_chars[init_indices]
+                        n_candidates = n_needed * oversample_factor
+                        base = init_optim_ids.repeat(n_candidates, 1)
+                        # Random distinct positions to perturb in each row.
+                        positions = torch.stack([
+                            torch.randperm(n_optim_ids, device=base.device)[:n_perturb]
+                            for _ in range(n_candidates)
+                        ])
+                        values = init_buffer_chars[
+                            torch.randint(0, init_buffer_chars.shape[0], (n_candidates, n_perturb), device=base.device)
+                        ]
+                        base = base.scatter(1, positions, values)
                         valid_random = torch.cat(
-                            [valid_random, filter_ids(candidates, tokenizer, raise_on_empty=False)],
+                            [valid_random, filter_ids(base, tokenizer, raise_on_empty=False)],
                             dim=0,
                         )
                     if valid_random.shape[0] < n_needed:
                         logger.warning(
-                            f"Only {valid_random.shape[0]}/{n_needed} random buffer entries "
+                            f"Only {valid_random.shape[0]}/{n_needed} perturbed buffer entries "
                             f"survived round-trip tokenization after {max_attempts} attempts; "
                             f"buffer will be smaller than requested."
                         )
                     n_filled = min(valid_random.shape[0], n_needed)
                     init_buffer_ids = torch.cat([init_optim_ids, valid_random[:n_filled]], dim=0)
                 else:
+                    # Legacy behavior: pure-random INIT_CHARS sequences. Fine
+                    # when filter_ids is off (caller isn't relying on round-trip).
                     init_indices = torch.randint(0, init_buffer_chars.shape[0], (n_needed, n_optim_ids))
                     init_buffer_ids = torch.cat([init_optim_ids, init_buffer_chars[init_indices]], dim=0)
             else:
