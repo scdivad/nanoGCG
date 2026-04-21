@@ -1,6 +1,6 @@
 """
-GCG / I-GCG attack on Llama Guard 3: force "safe" classification on harmful
-prompts.
+GCG / ACG / I-GCG attack on Llama Guard 3: force "safe" classification on
+harmful prompts.
 
 Unlike the standard GCG attack (which forces a target LLM to produce an
 affirmative response like "Sure, here's how..."), this attack optimizes an
@@ -17,13 +17,29 @@ ends with `<|end_header_id|>` (no trailing newlines). The model's response
 starts with "\\n\\nsafe" or "\\n\\nunsafe\\nS<n>". We therefore target the
 token sequence for "\\n\\nsafe".
 
-Pass `--i-gcg` to enable the I-GCG multi-coordinate update strategy from
-Jia et al. 2024 (arXiv:2405.21018). For the paper's easy-to-hard
-initialization, first run the attack on an "easy" prompt, then pass the
-resulting suffix string as `--optim-str-init "..."` when attacking a harder
-prompt. (The paper's "harmful guidance" target extension is a generation-side
+Three modes via `--mode`:
+  * `gcg`   — stock nanogcg defaults (Zou et al. 2023).
+  * `acg`   — pure speed preset: smaller candidate pool, multi-position
+              token swaps (`n_replace=4`), early-stop. ACG's
+              `buffer_size=16` is omitted here — see the comment on
+              `MODE_PRESETS["acg"]` for why; opt back in with
+              `--buffer-size 16`.
+  * `i-gcg` — I-GCG multi-coordinate merge (Jia et al. 2024,
+              arXiv:2405.21018) + the ACG speedups that don't conflict with
+              I-GCG's coordinate-descent semantics. Notably keeps
+              `n_replace=1` because I-GCG's top-p cumulative merge relies on
+              each candidate differing at exactly one position — with
+              `n_replace=4`, merges produce Frankenstein combinations whose
+              loss nothing validated.
+
+For I-GCG's easy-to-hard initialization, first attack an "easy" prompt, then
+pass the resulting suffix as `--optim-str-init "..."` when attacking a harder
+one. (The paper's "harmful guidance" target extension is a generation-side
 trick that doesn't transfer to a classifier; tune `--target` instead if you
 want to experiment.)
+
+Individual flags (`--search-width`, `--n-replace`, etc.) always override the
+mode preset.
 """
 
 import argparse
@@ -53,6 +69,40 @@ POLICY_MAPPING = {
 }
 
 
+MODE_PRESETS = {
+    "gcg": {},  # nanogcg defaults
+    # Pure ACG — all speed optimizations, no I-GCG.
+    #
+    # Note: ACG's `buffer_size=16` is omitted. On Llama 3's BPE, the random
+    # `INIT_CHARS` sequences that `init_buffer` drops into the extra slots
+    # produce starting points where no sampled candidate survives
+    # `filter_ids` round-trip filtering, so the run aborts at step 0.
+    # Filtering is load-bearing — it's what keeps token-space loss honest
+    # with respect to the string-space prompt the model will actually be
+    # generated from. Opt back in with `--buffer-size 16` if you want it.
+    "acg": dict(
+        search_width=64,
+        topk=64,
+        n_replace=4,
+        early_stop=True,
+        use_i_gcg=False,
+    ),
+    # I-GCG + non-conflicting ACG optimizations. `n_replace` stays at 1 so
+    # each candidate differs from the current suffix at exactly one position
+    # — a prerequisite for I-GCG's cumulative-merge logic to preserve
+    # coordinate-descent semantics. `buffer_size` also omitted for the same
+    # filter_ids reason as the `acg` preset.
+    "i-gcg": dict(
+        search_width=64,
+        topk=64,
+        n_replace=1,
+        early_stop=True,
+        use_i_gcg=True,
+        i_gcg_top_p=7,
+    ),
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -69,9 +119,18 @@ def parse_args() -> argparse.Namespace:
         "or '\\n\\nunsafe\\nS<n>' after the assistant header, so targeting "
         "'\\n\\nsafe' forces the classifier to mark the input as safe.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=list(MODE_PRESETS.keys()),
+        default="gcg",
+        help="Preset selection. See module docstring for what each mode does. "
+        "Individual flags below override the preset.",
+    )
     parser.add_argument("--num-steps", type=int, default=250)
-    parser.add_argument("--search-width", type=int, default=512)
-    parser.add_argument("--topk", type=int, default=256)
+    parser.add_argument("--search-width", type=int, default=None)
+    parser.add_argument("--topk", type=int, default=None)
+    parser.add_argument("--n-replace", type=int, default=None)
+    parser.add_argument("--buffer-size", type=int, default=None)
     parser.add_argument(
         "--optim-str-init",
         type=str,
@@ -83,23 +142,63 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbosity", type=str, default="INFO")
     parser.add_argument(
         "--early-stop",
-        action="store_true",
-        help="Stop as soon as the target tokens become argmax.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stop as soon as the target tokens become argmax. "
+        "Use --no-early-stop to disable.",
+    )
+    parser.add_argument(
+        "--filter-ids",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Filter out candidate suffixes that don't survive decode/encode "
+        "round-trip. Safer on tokenizers with stable BPE, but can wipe out "
+        "all candidates on Llama 3 when combined with small search_width + "
+        "non-zero buffer_size.",
     )
     parser.add_argument(
         "--i-gcg",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Use the I-GCG multi-coordinate update strategy "
-        "(Jia et al. 2024, arXiv:2405.21018).",
+        "(Jia et al. 2024, arXiv:2405.21018). Use --no-i-gcg to disable.",
     )
     parser.add_argument(
         "--i-gcg-top-p",
         type=int,
-        default=7,
+        default=None,
         help="Number of top single-token candidates to cumulatively merge "
         "per step when --i-gcg is set. Paper recommends 7.",
     )
     return parser.parse_args()
+
+
+def build_config(args: argparse.Namespace) -> GCGConfig:
+    """Resolve the mode preset + CLI overrides into a GCGConfig."""
+    cfg_kwargs = dict(
+        num_steps=args.num_steps,
+        optim_str_init=args.optim_str_init,
+        seed=args.seed,
+        verbosity=args.verbosity,
+    )
+    cfg_kwargs.update(MODE_PRESETS[args.mode])
+
+    # Explicit CLI values (non-None) override the preset.
+    cli_overrides = {
+        "search_width": args.search_width,
+        "topk": args.topk,
+        "n_replace": args.n_replace,
+        "buffer_size": args.buffer_size,
+        "early_stop": args.early_stop,
+        "filter_ids": args.filter_ids,
+        "use_i_gcg": args.i_gcg,
+        "i_gcg_top_p": args.i_gcg_top_p,
+    }
+    for key, val in cli_overrides.items():
+        if val is not None:
+            cfg_kwargs[key] = val
+
+    return GCGConfig(**cfg_kwargs)
 
 
 def classify(model, tokenizer, prompt: str, max_new_tokens: int = 20) -> str:
@@ -141,6 +240,7 @@ def main() -> None:
     model.eval()
 
     print("=" * 70)
+    print(f"Mode: {args.mode}")
     print(f"Prompt: {args.prompt}")
     print("=" * 70)
 
@@ -153,18 +253,7 @@ def main() -> None:
         )
 
     messages = [{"role": "user", "content": args.prompt}]
-
-    config = GCGConfig(
-        num_steps=args.num_steps,
-        optim_str_init=args.optim_str_init,
-        search_width=args.search_width,
-        topk=args.topk,
-        seed=args.seed,
-        verbosity=args.verbosity,
-        early_stop=args.early_stop,
-        use_i_gcg=args.i_gcg,
-        i_gcg_top_p=args.i_gcg_top_p,
-    )
+    config = build_config(args)
 
     result = nanogcg.run(model, tokenizer, messages, args.target, config)
 
