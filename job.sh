@@ -74,12 +74,14 @@ eval "$(conda shell.bash hook)"
 conda activate "$CONDA_ENV"
 
 OUT_FILE="results/attack_${SLURM_JOB_ID:-local}_${MODE}.jsonl"
+PT_DIR="results/pt_${SLURM_JOB_ID:-local}_${MODE}"
 
 echo "[job] host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
 echo "[job] cwd=$PWD  job_id=${SLURM_JOB_ID:-unknown}  conda_env=$CONDA_ENV"
 echo "[job] model=$MODEL_PATH"
 echo "[job] prompts=$PROMPTS_FILE  mode=$MODE  num_steps=$NUM_STEPS"
 echo "[job] results -> $OUT_FILE"
+echo "[job] pt dir  -> $PT_DIR"
 
 # -u: unbuffered stdout/stderr so tail -f on the log is live.
 VERIFY_EVERY="${VERIFY_EVERY:-20}"
@@ -93,6 +95,7 @@ python -u examples/llama_guard.py \
     --mode "$MODE" \
     --prompts-file "$PROMPTS_FILE" \
     --output-file "$OUT_FILE" \
+    --pt-output-dir "$PT_DIR" \
     --num-steps "$NUM_STEPS" \
     --no-early-stop \
     --verify-every "$VERIFY_EVERY" \
