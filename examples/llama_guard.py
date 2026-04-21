@@ -20,10 +20,9 @@ token sequence for "\\n\\nsafe".
 Three modes via `--mode`:
   * `gcg`   — stock nanogcg defaults (Zou et al. 2023).
   * `acg`   — pure speed preset: smaller candidate pool, multi-position
-              token swaps (`n_replace=4`), early-stop. ACG's
-              `buffer_size=16` is omitted here — see the comment on
-              `MODE_PRESETS["acg"]` for why; opt back in with
-              `--buffer-size 16`.
+              token swaps (`n_replace=4`), historical attack buffer,
+              early-stop. A faithful reproduction of the recipe in
+              `acg.md`.
   * `i-gcg` — I-GCG multi-coordinate merge (Jia et al. 2024,
               arXiv:2405.21018) + the ACG speedups that don't conflict with
               I-GCG's coordinate-descent semantics. Notably keeps
@@ -71,31 +70,24 @@ POLICY_MAPPING = {
 
 MODE_PRESETS = {
     "gcg": {},  # nanogcg defaults
-    # Pure ACG — all speed optimizations, no I-GCG.
-    #
-    # Note: ACG's `buffer_size=16` is omitted. On Llama 3's BPE, the random
-    # `INIT_CHARS` sequences that `init_buffer` drops into the extra slots
-    # produce starting points where no sampled candidate survives
-    # `filter_ids` round-trip filtering, so the run aborts at step 0.
-    # Filtering is load-bearing — it's what keeps token-space loss honest
-    # with respect to the string-space prompt the model will actually be
-    # generated from. Opt back in with `--buffer-size 16` if you want it.
+    # Pure ACG — faithful reproduction of the speed recipe in acg.md.
     "acg": dict(
         search_width=64,
         topk=64,
         n_replace=4,
+        buffer_size=16,
         early_stop=True,
         use_i_gcg=False,
     ),
     # I-GCG + non-conflicting ACG optimizations. `n_replace` stays at 1 so
     # each candidate differs from the current suffix at exactly one position
     # — a prerequisite for I-GCG's cumulative-merge logic to preserve
-    # coordinate-descent semantics. `buffer_size` also omitted for the same
-    # filter_ids reason as the `acg` preset.
+    # coordinate-descent semantics.
     "i-gcg": dict(
         search_width=64,
         topk=64,
         n_replace=1,
+        buffer_size=16,
         early_stop=True,
         use_i_gcg=True,
         i_gcg_top_p=7,

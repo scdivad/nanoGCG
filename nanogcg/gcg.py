@@ -161,7 +161,11 @@ def sample_ids_from_grad(
     return new_ids
 
 
-def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
+def filter_ids(
+    ids: Tensor,
+    tokenizer: transformers.PreTrainedTokenizer,
+    raise_on_empty: bool = True,
+):
     """Filters out sequeneces of token ids that change after retokenization.
 
     Args:
@@ -169,6 +173,11 @@ def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
             token ids
         tokenizer : ~transformers.PreTrainedTokenizer
             the model's tokenizer
+        raise_on_empty : bool
+            if True (default) and no rows survive, raise RuntimeError;
+            if False, return a zero-row tensor instead. Callers that are
+            using filtering as a best-effort pass (e.g. pruning randomly
+            generated buffer entries at init) should set this to False.
 
     Returns:
         filtered_ids : Tensor, shape = (new_search_width, n_optim_ids)
@@ -184,11 +193,13 @@ def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
             filtered_ids.append(ids[i])
 
     if not filtered_ids:
-        # This occurs in some cases, e.g. using the Llama-3 tokenizer with a bad initialization
-        raise RuntimeError(
-            "No token sequences are the same after decoding and re-encoding. "
-            "Consider setting `filter_ids=False` or trying a different `optim_str_init`"
-        )
+        if raise_on_empty:
+            # This occurs in some cases, e.g. using the Llama-3 tokenizer with a bad initialization
+            raise RuntimeError(
+                "No token sequences are the same after decoding and re-encoding. "
+                "Consider setting `filter_ids=False` or trying a different `optim_str_init`"
+            )
+        return ids.new_empty((0, ids.shape[1]))
 
     return torch.stack(filtered_ids)
 
@@ -413,9 +424,44 @@ class GCG:
         if isinstance(config.optim_str_init, str):
             init_optim_ids = tokenizer(config.optim_str_init, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device)
             if config.buffer_size > 1:
-                init_buffer_ids = tokenizer(INIT_CHARS, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze().to(model.device)
-                init_indices = torch.randint(0, init_buffer_ids.shape[0], (config.buffer_size - 1, init_optim_ids.shape[1]))
-                init_buffer_ids = torch.cat([init_optim_ids, init_buffer_ids[init_indices]], dim=0)
+                init_buffer_chars = tokenizer(INIT_CHARS, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze().to(model.device)
+                n_needed = config.buffer_size - 1
+                n_optim_ids = init_optim_ids.shape[1]
+                if config.filter_ids:
+                    # Oversample random INIT_CHARS sequences and drop any that
+                    # don't survive decode/re-encode round-trip. Tokenizers
+                    # with aggressive BPE merging (e.g. Llama 3) often merge
+                    # random-punctuation token sequences differently when
+                    # re-tokenized as a concatenated string — if those
+                    # entries are admitted to the buffer, any later
+                    # `filter_ids` pass during the main loop can wipe out
+                    # every candidate sampled from them and crash the run.
+                    oversample_factor = 8
+                    max_attempts = 4
+                    valid_random = init_optim_ids.new_empty((0, n_optim_ids))
+                    for _ in range(max_attempts):
+                        if valid_random.shape[0] >= n_needed:
+                            break
+                        init_indices = torch.randint(
+                            0, init_buffer_chars.shape[0],
+                            (n_needed * oversample_factor, n_optim_ids),
+                        )
+                        candidates = init_buffer_chars[init_indices]
+                        valid_random = torch.cat(
+                            [valid_random, filter_ids(candidates, tokenizer, raise_on_empty=False)],
+                            dim=0,
+                        )
+                    if valid_random.shape[0] < n_needed:
+                        logger.warning(
+                            f"Only {valid_random.shape[0]}/{n_needed} random buffer entries "
+                            f"survived round-trip tokenization after {max_attempts} attempts; "
+                            f"buffer will be smaller than requested."
+                        )
+                    n_filled = min(valid_random.shape[0], n_needed)
+                    init_buffer_ids = torch.cat([init_optim_ids, valid_random[:n_filled]], dim=0)
+                else:
+                    init_indices = torch.randint(0, init_buffer_chars.shape[0], (n_needed, n_optim_ids))
+                    init_buffer_ids = torch.cat([init_optim_ids, init_buffer_chars[init_indices]], dim=0)
             else:
                 init_buffer_ids = init_optim_ids
 
@@ -427,7 +473,8 @@ class GCG:
             except ValueError:
                 logger.error("Unable to create buffer. Ensure that all initializations tokenize to the same length.")
 
-        true_buffer_size = max(1, config.buffer_size)
+        # Buffer may be smaller than requested if random-entry filtering came up short.
+        true_buffer_size = max(1, init_buffer_ids.shape[0])
 
         # Compute the loss on the initial buffer entries
         if self.prefix_cache:
