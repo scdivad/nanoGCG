@@ -82,7 +82,7 @@ echo "[job] prompts=$PROMPTS_FILE  mode=$MODE  num_steps=$NUM_STEPS"
 echo "[job] results -> $OUT_FILE"
 
 # -u: unbuffered stdout/stderr so tail -f on the log is live.
-VERIFY_EVERY="${VERIFY_EVERY:-5}"
+VERIFY_EVERY="${VERIFY_EVERY:-20}"
 
 # Disable nanogcg's token-space early_stop (false-positives on Llama 3's BPE
 # boundary) and use --verify-every instead: every K steps the driver decodes
