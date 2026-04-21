@@ -61,6 +61,12 @@ class GCGConfig:
     seed: int = None
     verbosity: str = "INFO"
     probe_sampling_config: Optional[ProbeSamplingConfig] = None
+    # I-GCG (Jia et al. 2024, arXiv:2405.21018): after scoring all single-token
+    # candidates, cumulatively merge the top-p lowest-loss candidates' diffs
+    # against the current suffix and re-score those p merged variants, picking
+    # the best. Assumes `n_replace=1`.
+    use_i_gcg: bool = False
+    i_gcg_top_p: int = 7
 
 
 @dataclass
@@ -209,6 +215,8 @@ class GCG:
         self.draft_tokenizer = None
         self.draft_embedding_layer = None
         if self.config.probe_sampling_config:
+            if self.config.use_i_gcg:
+                raise ValueError("`use_i_gcg` is not compatible with `probe_sampling_config`.")
             self.draft_model = self.config.probe_sampling_config.draft_model
             self.draft_tokenizer = self.config.probe_sampling_config.draft_tokenizer
             self.draft_embedding_layer = self.draft_model.get_input_embeddings()
@@ -348,8 +356,19 @@ class GCG:
 
                 if self.config.probe_sampling_config is None:
                     loss = find_executable_batch_size(self._compute_candidates_loss_original, batch_size)(input_embeds)
-                    current_loss = loss.min().item()
-                    optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
+                    if config.use_i_gcg:
+                        current_loss, optim_ids = self._i_gcg_merge_step(
+                            sampled_ids=sampled_ids,
+                            single_token_losses=loss,
+                            current_optim_ids=optim_ids,
+                            after_embeds=after_embeds,
+                            target_embeds=target_embeds,
+                            before_embeds=before_embeds,
+                            batch_size=batch_size,
+                        )
+                    else:
+                        current_loss = loss.min().item()
+                        optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
                 else:
                     current_loss, optim_ids = find_executable_batch_size(self._compute_candidates_loss_probe_sampling, batch_size)(
                         input_embeds, sampled_ids,
@@ -493,6 +512,66 @@ class GCG:
         optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
 
         return optim_ids_onehot_grad
+
+    def _i_gcg_merge_step(
+        self,
+        sampled_ids: Tensor,
+        single_token_losses: Tensor,
+        current_optim_ids: Tensor,
+        after_embeds: Tensor,
+        target_embeds: Tensor,
+        before_embeds: Tensor,
+        batch_size: int,
+    ) -> Tuple[float, Tensor]:
+        """I-GCG multi-coordinate update (Jia et al. 2024, Eq. 8 / Algo. 1).
+
+        Sort the single-token candidates by loss, then cumulatively merge the
+        top-p lowest-loss candidates' position-wise diffs into the current
+        suffix. Re-score the p merged variants and return the best.
+        """
+        p = min(self.config.i_gcg_top_p, sampled_ids.shape[0])
+        # Indices of the p lowest-loss single-token candidates, sorted ascending.
+        top_idx = torch.topk(single_token_losses, p, largest=False).indices
+        top_idx = top_idx[torch.argsort(single_token_losses[top_idx])]
+
+        original_ids = current_optim_ids.squeeze(0)  # (n_optim_ids,)
+        merged_ids = original_ids.clone()
+        merged_candidates = []
+        for i in range(p):
+            cand = sampled_ids[top_idx[i]]
+            # Accept any position where this candidate differs from the
+            # *original* suffix. Since GCG samples with n_replace=1, each
+            # candidate changes exactly one position vs. the original, so this
+            # cumulatively unions those changed positions into merged_ids.
+            diff_mask = cand != original_ids
+            merged_ids = torch.where(diff_mask, cand, merged_ids)
+            merged_candidates.append(merged_ids.clone())
+        merged_candidates = torch.stack(merged_candidates, dim=0)
+
+        embedding_layer = self.embedding_layer
+        if self.prefix_cache:
+            merged_embeds = torch.cat(
+                [
+                    embedding_layer(merged_candidates),
+                    after_embeds.repeat(p, 1, 1),
+                    target_embeds.repeat(p, 1, 1),
+                ],
+                dim=1,
+            )
+        else:
+            merged_embeds = torch.cat(
+                [
+                    before_embeds.repeat(p, 1, 1),
+                    embedding_layer(merged_candidates),
+                    after_embeds.repeat(p, 1, 1),
+                    target_embeds.repeat(p, 1, 1),
+                ],
+                dim=1,
+            )
+
+        merged_losses = find_executable_batch_size(self._compute_candidates_loss_original, min(batch_size, p))(merged_embeds)
+        best = merged_losses.argmin()
+        return merged_losses[best].item(), merged_candidates[best].unsqueeze(0)
 
     def _compute_candidates_loss_original(
         self,
