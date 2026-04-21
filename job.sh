@@ -82,6 +82,12 @@ echo "[job] prompts=$PROMPTS_FILE  mode=$MODE  num_steps=$NUM_STEPS"
 echo "[job] results -> $OUT_FILE"
 
 # -u: unbuffered stdout/stderr so tail -f on the log is live.
+VERIFY_EVERY="${VERIFY_EVERY:-5}"
+
+# Disable nanogcg's token-space early_stop (false-positives on Llama 3's BPE
+# boundary) and use --verify-every instead: every K steps the driver decodes
+# the current best suffix, runs the real Llama Guard classification pipeline,
+# and early-stops only when the attack actually flips to "safe" end-to-end.
 python -u examples/llama_guard.py \
     --model "$MODEL_PATH" \
     --mode "$MODE" \
@@ -89,6 +95,7 @@ python -u examples/llama_guard.py \
     --output-file "$OUT_FILE" \
     --num-steps "$NUM_STEPS" \
     --no-early-stop \
+    --verify-every "$VERIFY_EVERY" \
     --skip-already-safe \
     --seed 0 \
     --verbosity WARNING

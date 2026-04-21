@@ -6,7 +6,7 @@ import threading
 
 from dataclasses import dataclass
 from tqdm import tqdm
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import transformers
@@ -67,6 +67,15 @@ class GCGConfig:
     # the best. Assumes `n_replace=1`.
     use_i_gcg: bool = False
     i_gcg_top_p: int = 7
+    # String-space early stop. Every `early_stop_check_every` steps, call this
+    # callback with (step, current_best_optim_ids, current_loss); if it returns
+    # True the run stops. Intended for decoding the current best suffix to a
+    # string, running the real inference pipeline, and checking whether the
+    # attack actually works end-to-end (rather than just winning in token
+    # space, which can spuriously fire via `early_stop` when the chat-template
+    # boundary re-tokenizes differently at inference time).
+    early_stop_callback: Optional[Callable[[int, Tensor, float], bool]] = None
+    early_stop_check_every: int = 5
 
 
 @dataclass
@@ -328,7 +337,7 @@ class GCG:
         losses = []
         optim_strings = []
 
-        for _ in tqdm(range(config.num_steps)):
+        for step in tqdm(range(config.num_steps)):
             # Compute the token gradient
             optim_ids_onehot_grad = self.compute_token_gradient(optim_ids)
 
@@ -395,6 +404,25 @@ class GCG:
             optim_strings.append(optim_str)
 
             buffer.log_buffer(tokenizer)
+
+            # String-space early-stop: periodically invoke the user-supplied
+            # callback with the current best suffix. Unlike the token-space
+            # `early_stop` flag (which checks argmax logits against target_ids
+            # and fires spuriously when the chat-template boundary
+            # re-tokenizes differently at inference time), the callback gets
+            # to decode the suffix and run the real inference pipeline. Use
+            # `(step + 1) % K == 0` so step indexing starts from 1 and we
+            # don't waste a check at step 0 (before any optimization).
+            if (
+                config.early_stop_callback is not None
+                and (step + 1) % max(1, config.early_stop_check_every) == 0
+            ):
+                try:
+                    if config.early_stop_callback(step, optim_ids, current_loss):
+                        logger.info(f"Early stopping at step {step + 1} via verifier callback.")
+                        self.stop_flag = True
+                except Exception as e:
+                    logger.warning(f"early_stop_callback raised {type(e).__name__}: {e}; continuing.")
 
             if self.stop_flag:
                 logger.info("Early stopping due to finding a perfect match.")
