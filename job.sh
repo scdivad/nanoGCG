@@ -4,7 +4,7 @@
 #SBATCH --gpus=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --nodes=1
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 #SBATCH --mem=48G
 #SBATCH --job-name=lg-gcg
 #SBATCH --output=logs/lg-gcg_%j.out
@@ -19,16 +19,16 @@ set -euo pipefail
 #
 # Per-step times measured on A100-PCIE-40GB: ACG ~0.87 s/step, I-GCG
 # ~1.04 s/step. On H100 SXM5 expect ~1.7-1.8x speedup (~0.5-0.6 s/step).
-# At num_steps=100, 100 prompts takes ~85-100 min on an H100 before
-# --skip-already-safe discounts the safe-by-default prompts. 3h walltime
-# leaves a comfortable cushion.
+# At num_steps=250, 100 prompts takes ~3-4h on H100, ~5-6h on A100
+# before --skip-already-safe and --verify-every early-stops discount
+# converged prompts. 6h walltime leaves headroom for the A100 case.
 #
 # Environment overrides:
 #   NANOGCG_REPO      path to this repo (defaults to $SLURM_SUBMIT_DIR)
 #   LLAMA_GUARD_PATH  path to Llama-Guard-3-8B weights
 #   PROMPTS_FILE      path to one-prompt-per-line text file
 #   MODE              gcg | acg | i-gcg  (default: i-gcg)
-#   NUM_STEPS         GCG iterations per prompt (default: 100)
+#   NUM_STEPS         GCG iterations per prompt (default: 250)
 #   CONDA_ENV         conda env name (default: gcg)
 
 # Under sbatch, $BASH_SOURCE points at SLURM's spool copy of the script,
@@ -48,7 +48,7 @@ mkdir -p logs results
 MODEL_PATH="${LLAMA_GUARD_PATH:-/home/davidsc2/FOCAL/ctlm/pulled/Llama-Guard-3-8B}"
 PROMPTS_FILE="${PROMPTS_FILE:-$REPO/prompts.txt}"
 MODE="${MODE:-i-gcg}"
-NUM_STEPS="${NUM_STEPS:-100}"
+NUM_STEPS="${NUM_STEPS:-250}"
 CONDA_ENV="${CONDA_ENV:-gcg}"
 
 if [ ! -d "$MODEL_PATH" ]; then
