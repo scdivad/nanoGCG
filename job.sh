@@ -86,6 +86,20 @@ echo "[job] pt dir  -> $PT_DIR"
 # -u: unbuffered stdout/stderr so tail -f on the log is live.
 VERIFY_EVERY="${VERIFY_EVERY:-20}"
 
+# Optional: resume from a previous job's JSONL. Prompts whose text appears
+# there are skipped this run. Use to recover after a mid-sweep crash:
+#   RESUME_FROM=results/attack_<old-jobid>_i-gcg.jsonl sbatch job.sh
+RESUME_FROM="${RESUME_FROM:-}"
+RESUME_FLAG=()
+if [ -n "$RESUME_FROM" ]; then
+    if [ ! -f "$RESUME_FROM" ]; then
+        echo "ERROR: RESUME_FROM=$RESUME_FROM doesn't exist." >&2
+        exit 1
+    fi
+    RESUME_FLAG=(--resume-from "$RESUME_FROM")
+    echo "[job] resume-from -> $RESUME_FROM"
+fi
+
 # Disable nanogcg's token-space early_stop (false-positives on Llama 3's BPE
 # boundary) and use --verify-every instead: every K steps the driver decodes
 # the current best suffix, runs the real Llama Guard classification pipeline,
@@ -100,6 +114,7 @@ python -u examples/llama_guard.py \
     --no-early-stop \
     --verify-every "$VERIFY_EVERY" \
     --skip-already-safe \
+    "${RESUME_FLAG[@]}" \
     --seed 0 \
     --verbosity WARNING
 

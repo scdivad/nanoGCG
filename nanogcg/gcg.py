@@ -343,18 +343,39 @@ class GCG:
 
             with torch.no_grad():
 
-                # Sample candidate token sequences based on the token gradient
-                sampled_ids = sample_ids_from_grad(
-                    optim_ids.squeeze(0),
-                    optim_ids_onehot_grad.squeeze(0),
-                    config.search_width,
-                    config.topk,
-                    config.n_replace,
-                    not_allowed_ids=self.not_allowed_ids,
-                )
-
-                if config.filter_ids:
-                    sampled_ids = filter_ids(sampled_ids, tokenizer)
+                # Sample candidate token sequences based on the token gradient.
+                # If filter_ids is on and nothing survives round-trip, retry a
+                # few times — the sampling is stochastic (random positions +
+                # random topk picks), so a fresh draw usually surfaces at
+                # least some surviving candidates. Only if all retries fail do
+                # we skip this step (keep current optim_ids, move on).
+                filter_attempts = 4
+                sampled_ids = None
+                for attempt in range(filter_attempts):
+                    candidates = sample_ids_from_grad(
+                        optim_ids.squeeze(0),
+                        optim_ids_onehot_grad.squeeze(0),
+                        config.search_width,
+                        config.topk,
+                        config.n_replace,
+                        not_allowed_ids=self.not_allowed_ids,
+                    )
+                    if config.filter_ids:
+                        candidates = filter_ids(candidates, tokenizer, raise_on_empty=False)
+                    if candidates.shape[0] > 0:
+                        sampled_ids = candidates
+                        break
+                if sampled_ids is None:
+                    logger.warning(
+                        f"Step {step + 1}: no sampled candidates survived `filter_ids` "
+                        f"after {filter_attempts} retries; skipping this step."
+                    )
+                    # Record the unchanged loss so the step is still reflected in
+                    # the losses list (otherwise len(losses) != num_steps).
+                    losses.append(buffer.get_lowest_loss())
+                    optim_str = tokenizer.batch_decode(buffer.get_best_ids())[0]
+                    optim_strings.append(optim_str)
+                    continue
 
                 new_search_width = sampled_ids.shape[0]
 

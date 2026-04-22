@@ -153,6 +153,16 @@ def parse_args() -> argparse.Namespace:
         "(attacking them is pointless).",
     )
     parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to an existing JSONL produced by a previous run. Any "
+        "prompt whose exact text already appears in a record in that file "
+        "is skipped this run. Useful for recovering after a crash: point "
+        "--output-file at a fresh JSONL and --resume-from at the one from "
+        "the crashed job.",
+    )
+    parser.add_argument(
         "--target",
         type=str,
         default="\n\nsafe",
@@ -520,6 +530,28 @@ def main() -> None:
     prompts = load_prompts(args)
     print(f"Loaded {len(prompts)} prompt(s). Mode: {args.mode}")
 
+    # If resuming, drop any prompt whose exact text already appears in the
+    # given JSONL (one record per prompt, matched by exact string).
+    already_done: set = set()
+    if args.resume_from:
+        rp = Path(args.resume_from)
+        if not rp.exists():
+            raise SystemExit(f"--resume-from path doesn't exist: {rp}")
+        for line in rp.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "prompt" in obj:
+                already_done.add(obj["prompt"])
+        before = len(prompts)
+        prompts = [p for p in prompts if p not in already_done]
+        print(f"Resume: dropped {before - len(prompts)} prompt(s) already in {rp} "
+              f"({len(prompts)} remaining).")
+
     print("Loading model...")
     t0 = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -576,11 +608,29 @@ def main() -> None:
                         out_fh.flush()
                     continue
 
-            record = attack_one(
-                model, tokenizer, prompt, args.target, config,
-                verify_every=args.verify_every,
-                adv_position=args.adv_position,
-            )
+            try:
+                record = attack_one(
+                    model, tokenizer, prompt, args.target, config,
+                    verify_every=args.verify_every,
+                    adv_position=args.adv_position,
+                )
+            except Exception as e:
+                # Don't let one wedged prompt tank a 100-prompt sweep.
+                import traceback
+                tb = traceback.format_exc(limit=6)
+                print(f"  ERROR during attack on prompt {idx}: {type(e).__name__}: {e}")
+                print(tb)
+                if out_fh:
+                    out_fh.write(json.dumps({
+                        "prompt": prompt,
+                        "error": f"{type(e).__name__}: {e}",
+                        "traceback": tb,
+                        "crashed": True,
+                    }) + "\n")
+                    out_fh.flush()
+                transitions.setdefault("crashed", 0)
+                transitions["crashed"] += 1
+                continue
             record["adv_position"] = args.adv_position
             total_elapsed += record["elapsed_sec"]
             if record["success"]:
