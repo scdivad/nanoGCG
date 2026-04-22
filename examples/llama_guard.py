@@ -117,9 +117,11 @@ def parse_args() -> argparse.Namespace:
         "--prompts-file",
         type=str,
         default=None,
-        help="Path to a text file with one prompt per line (blank lines and "
-        "lines starting with '#' are skipped). Attacks every prompt in a "
-        "single run — the model is loaded once.",
+        help="Path to a prompts file. If it ends in .jsonl, each line is a "
+        "JSON object with a 'prompt' key (supports embedded newlines). "
+        "Otherwise, one prompt per line (blank lines and '#'-comments "
+        "skipped; newlines in prompt text are not supported in this mode). "
+        "Attacks every prompt in a single run — the model is loaded once.",
     )
     parser.add_argument(
         "--output-file",
@@ -219,6 +221,17 @@ def parse_args() -> argparse.Namespace:
         "argmax and fires spuriously on Llama 3's BPE boundary), this verifies "
         "the attack works end-to-end. Typical value: 5.",
     )
+    parser.add_argument(
+        "--adv-position",
+        choices=["suffix", "prefix"],
+        default="suffix",
+        help="Where to place the adversarial string in the user message. "
+        "'suffix' (default) appends after the prompt; 'prefix' prepends "
+        "before it. Downstream activation-patching work predicts Q/K/V "
+        "recovery should rise sharply under 'prefix' because the content "
+        "and verdict positions have to attend back to the adversarial "
+        "tokens.",
+    )
     return parser.parse_args()
 
 
@@ -296,18 +309,35 @@ def pretty_classification(label: str) -> str:
 
 
 def load_prompts(args: argparse.Namespace) -> List[str]:
-    """Resolve --prompt / --prompts-file into a list of prompts to attack."""
+    """Resolve --prompt / --prompts-file into a list of prompts to attack.
+
+    Two file formats supported:
+    * Plain text (one prompt per line; '#'-comments and blank lines skipped).
+      Doesn't support prompts that contain newlines.
+    * JSONL — any file ending in '.jsonl'. One JSON object per line, each
+      with a 'prompt' key. Supports embedded newlines, tabs, etc.
+    """
     if args.prompt and args.prompts_file:
         raise SystemExit("Pass exactly one of --prompt or --prompts-file, not both.")
     if args.prompt:
         return [args.prompt]
     if args.prompts_file:
         path = Path(args.prompts_file)
-        prompts = []
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                prompts.append(line)
+        prompts: List[str] = []
+        if path.suffix.lower() == ".jsonl":
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                obj = json.loads(line)
+                if "prompt" not in obj:
+                    raise SystemExit(f"JSONL line is missing a 'prompt' key: {line[:120]}")
+                prompts.append(obj["prompt"])
+        else:
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    prompts.append(line)
         if args.limit is not None:
             prompts = prompts[: args.limit]
         if not prompts:
@@ -374,6 +404,7 @@ def save_pt_record(
         "success": record["success"],
         "target": target,
         "mode": mode,
+        "adv_position": record.get("adv_position", "suffix"),
         "tokenizer_name_or_path": getattr(tokenizer, "name_or_path", ""),
     }
     path = pt_dir / f"prompt_{idx:03d}.pt"
@@ -381,7 +412,16 @@ def save_pt_record(
     return path
 
 
-def make_string_space_verifier(model, tokenizer, prompt: str):
+def build_attacked_content(prompt: str, adv_str: str, position: str) -> str:
+    """Assemble the user-message content from the prompt and adversarial
+    string according to `position`. Matches nanogcg's token-level concat
+    (no injected space; see gcg.py:247-248)."""
+    if position == "prefix":
+        return adv_str + prompt
+    return prompt + adv_str
+
+
+def make_string_space_verifier(model, tokenizer, prompt: str, adv_position: str = "suffix"):
     """Build an early-stop callback that decodes the current best suffix,
     runs the real Llama Guard classification pipeline, and returns True
     when the attacked prompt is classified as safe at inference time.
@@ -398,13 +438,8 @@ def make_string_space_verifier(model, tokenizer, prompt: str):
         # driver kept them, reserved tokens in the suffix would cause the
         # verifier and the final check to disagree about what the "attacked
         # prompt" is.
-        suffix_str = tokenizer.batch_decode(optim_ids)[0]
-        # No injected " " — nanogcg internally appends `{optim_str}` directly
-        # to the prompt content (no space), so the optim tokens follow the
-        # prompt tokens with only whatever leading-space the first optim
-        # token naturally encodes. Adding a literal space here would yield
-        # a different attacked prompt than what was optimized.
-        attacked = prompt + suffix_str
+        adv_str = tokenizer.batch_decode(optim_ids)[0]
+        attacked = build_attacked_content(prompt, adv_str, adv_position)
         label = classify(model, tokenizer, attacked)
         verdict, _ = parse_verdict(label)
         return verdict == "safe"
@@ -418,6 +453,7 @@ def attack_one(
     target: str,
     config: GCGConfig,
     verify_every: int = 0,
+    adv_position: str = "suffix",
 ) -> dict:
     """Run one attack and return a structured result."""
     pre = classify(model, tokenizer, prompt)
@@ -425,26 +461,32 @@ def attack_one(
     if verify_every > 0:
         config = dataclasses.replace(
             config,
-            early_stop_callback=make_string_space_verifier(model, tokenizer, prompt),
+            early_stop_callback=make_string_space_verifier(
+                model, tokenizer, prompt, adv_position=adv_position
+            ),
             early_stop_check_every=verify_every,
         )
+
+    # Tell nanogcg where to place the adversarial string. If the content
+    # contains the literal "{optim_str}" placeholder, nanogcg respects
+    # that placement instead of auto-appending at the end (gcg.py:247-248).
+    if adv_position == "prefix":
+        content = "{optim_str}" + prompt
+    else:
+        content = prompt  # nanogcg will auto-append the placeholder at end
 
     start = time.perf_counter()
     result = nanogcg.run(
         model,
         tokenizer,
-        [{"role": "user", "content": prompt}],
+        [{"role": "user", "content": content}],
         target,
         config,
     )
     elapsed = time.perf_counter() - start
 
-    # Match nanogcg's optimization-time concatenation: content + "{optim_str}"
-    # is appended with NO injected space (gcg.py:247-248). The first suffix
-    # token typically encodes its own leading space via BPE; injecting an
-    # extra " " here would produce a double-space and mismatch the string
-    # the optimizer saw.
-    attacked_prompt = prompt + result.best_string
+    # Match nanogcg's optimization-time concatenation: no injected space.
+    attacked_prompt = build_attacked_content(prompt, result.best_string, adv_position)
     post = classify(model, tokenizer, attacked_prompt)
 
     pre_verdict, pre_category = parse_verdict(pre)
@@ -537,7 +579,9 @@ def main() -> None:
             record = attack_one(
                 model, tokenizer, prompt, args.target, config,
                 verify_every=args.verify_every,
+                adv_position=args.adv_position,
             )
+            record["adv_position"] = args.adv_position
             total_elapsed += record["elapsed_sec"]
             if record["success"]:
                 successes += 1
