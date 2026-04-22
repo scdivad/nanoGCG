@@ -113,6 +113,21 @@ if [ -n "$RESUME_FROM" ]; then
     echo "[job] resume-from -> $RESUME_FROM"
 fi
 
+# Optional: I-GCG easy-to-hard init. Point at a previous run's JSONL; the
+# driver picks the lowest-loss successful suffix and uses it as the init
+# for every prompt in this run. Must be from a run on the SAME model.
+#   INIT_FROM_JSONL=results/attack_<prior-jobid>_lat_i-gcg.jsonl sbatch job.sh
+INIT_FROM_JSONL="${INIT_FROM_JSONL:-}"
+INIT_FROM_FLAG=()
+if [ -n "$INIT_FROM_JSONL" ]; then
+    if [ ! -f "$INIT_FROM_JSONL" ]; then
+        echo "ERROR: INIT_FROM_JSONL=$INIT_FROM_JSONL doesn't exist." >&2
+        exit 1
+    fi
+    INIT_FROM_FLAG=(--init-from-jsonl "$INIT_FROM_JSONL")
+    echo "[job] init-from-jsonl -> $INIT_FROM_JSONL"
+fi
+
 # Disable nanogcg's token-space early_stop (false-positives on Llama 3's BPE
 # boundary) and use --verify-every instead: every K steps the driver decodes
 # the current best suffix, runs the real Llama Guard classification pipeline,
@@ -129,6 +144,7 @@ python -u examples/llama_guard.py \
     --verify-every "$VERIFY_EVERY" \
     --skip-already-safe \
     "${RESUME_FLAG[@]}" \
+    "${INIT_FROM_FLAG[@]}" \
     --seed 0 \
     --verbosity WARNING
 

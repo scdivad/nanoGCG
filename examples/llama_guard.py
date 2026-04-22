@@ -173,6 +173,17 @@ def parse_args() -> argparse.Namespace:
         "the crashed job.",
     )
     parser.add_argument(
+        "--init-from-jsonl",
+        type=str,
+        default=None,
+        help="I-GCG easy-to-hard init: read a JSONL from a previous attack, "
+        "pick the successful attack with lowest best_loss, and use its "
+        "best_suffix as optim_str_init for EVERY prompt in this run. "
+        "IMPORTANT: must be from a run on the SAME model (a base-model "
+        "suffix typically doesn't transfer cleanly to LAT and vice-versa). "
+        "Overrides --optim-str-init for the whole sweep.",
+    )
+    parser.add_argument(
         "--target",
         type=str,
         default="\n\nsafe",
@@ -326,6 +337,46 @@ def pretty_classification(label: str) -> str:
     if verdict == "other":
         return f"other: {label!r}"
     return verdict
+
+
+def pick_best_suffix_from_jsonl(path: str) -> str:
+    """Scan a JSONL of attack records and return the best_suffix of the
+    successful attack with the lowest best_loss.
+
+    I-GCG's easy-to-hard init: one good suffix found on one (any) prompt
+    transfers well to other prompts on the same model. Picking the
+    lowest-loss success gives the tightest local optimum we have.
+    """
+    candidates = []  # (loss, suffix, source_prompt)
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                obj.get("success") is True
+                and isinstance(obj.get("best_suffix"), str)
+                and isinstance(obj.get("best_loss"), (int, float))
+            ):
+                candidates.append(
+                    (float(obj["best_loss"]), obj["best_suffix"], obj.get("prompt", "<?>"))
+                )
+    if not candidates:
+        raise SystemExit(
+            f"--init-from-jsonl: no successful records with best_suffix + "
+            f"best_loss found in {path}. At least one prompt must have "
+            f"flipped to safe."
+        )
+    candidates.sort(key=lambda x: x[0])
+    loss, suffix, source = candidates[0]
+    print(f"[init-from-jsonl] picked from {path}")
+    print(f"[init-from-jsonl]   source prompt: {source[:80]!r}")
+    print(f"[init-from-jsonl]   loss={loss:.4f}  suffix={suffix!r}")
+    return suffix
 
 
 def load_prompts(args: argparse.Namespace) -> List[str]:
@@ -580,6 +631,15 @@ def main() -> None:
           f"({'LAT/adapter' if args.adapter_path else 'base'}).")
 
     config = build_config(args)
+
+    # I-GCG easy-to-hard init: if given a previous JSONL, replace the config's
+    # optim_str_init with the best successful suffix from it. This overrides
+    # --optim-str-init (if the user passed that too — they probably don't want
+    # both). Applied once here so every prompt in the sweep starts from the
+    # same warm init.
+    if args.init_from_jsonl:
+        warm_init = pick_best_suffix_from_jsonl(args.init_from_jsonl)
+        config = dataclasses.replace(config, optim_str_init=warm_init)
 
     out_path: Optional[Path] = None
     out_fh = None
