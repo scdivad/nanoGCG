@@ -108,6 +108,16 @@ def parse_args() -> argparse.Namespace:
         default="/home/davidsc2/FOCAL/ctlm/pulled/Llama-Guard-3-8B",
     )
     parser.add_argument(
+        "--adapter-path",
+        type=str,
+        default=None,
+        help="Optional PEFT/LoRA adapter directory to attach on top of the "
+        "base model (e.g. a LAT-hardened checkpoint). Requires `peft` "
+        "installed. GCG still computes gradients through input embeddings "
+        "and the adapter's forward path transparently, so no special "
+        "handling is needed beyond loading the model.",
+    )
+    parser.add_argument(
         "--prompt",
         type=str,
         default=None,
@@ -561,7 +571,13 @@ def main() -> None:
         device_map=args.device_map,
     )
     model.eval()
-    print(f"Model loaded in {time.perf_counter() - t0:.1f}s.")
+    if args.adapter_path:
+        from peft import PeftModel  # imported lazily so non-adapter runs don't need peft
+        print(f"Attaching adapter: {args.adapter_path}")
+        model = PeftModel.from_pretrained(model, args.adapter_path)
+        model.eval()
+    print(f"Model loaded in {time.perf_counter() - t0:.1f}s "
+          f"({'LAT/adapter' if args.adapter_path else 'base'}).")
 
     config = build_config(args)
 

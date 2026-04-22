@@ -73,12 +73,25 @@ module load anaconda3/2020.11
 eval "$(conda shell.bash hook)"
 conda activate "$CONDA_ENV"
 
-OUT_FILE="results/attack_${SLURM_JOB_ID:-local}_${MODE}.jsonl"
-PT_DIR="results/pt_${SLURM_JOB_ID:-local}_${MODE}"
+ADAPTER_PATH="${ADAPTER_PATH:-}"
+ADAPTER_FLAG=()
+TARGET_TAG="base"
+if [ -n "$ADAPTER_PATH" ]; then
+    if [ ! -d "$ADAPTER_PATH" ]; then
+        echo "ERROR: ADAPTER_PATH=$ADAPTER_PATH doesn't exist." >&2
+        exit 1
+    fi
+    ADAPTER_FLAG=(--adapter-path "$ADAPTER_PATH")
+    TARGET_TAG="lat"
+fi
+
+OUT_FILE="results/attack_${SLURM_JOB_ID:-local}_${TARGET_TAG}_${MODE}.jsonl"
+PT_DIR="results/pt_${SLURM_JOB_ID:-local}_${TARGET_TAG}_${MODE}"
 
 echo "[job] host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
 echo "[job] cwd=$PWD  job_id=${SLURM_JOB_ID:-unknown}  conda_env=$CONDA_ENV"
 echo "[job] model=$MODEL_PATH"
+echo "[job] adapter=${ADAPTER_PATH:-<none - attacking base model>}"
 echo "[job] prompts=$PROMPTS_FILE  mode=$MODE  num_steps=$NUM_STEPS"
 echo "[job] results -> $OUT_FILE"
 echo "[job] pt dir  -> $PT_DIR"
@@ -106,6 +119,7 @@ fi
 # and early-stops only when the attack actually flips to "safe" end-to-end.
 python -u examples/llama_guard.py \
     --model "$MODEL_PATH" \
+    "${ADAPTER_FLAG[@]}" \
     --mode "$MODE" \
     --prompts-file "$PROMPTS_FILE" \
     --output-file "$OUT_FILE" \
