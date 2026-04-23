@@ -4,13 +4,24 @@ Analogous to harm_classifiers/eps_calibrate.py but for a decoder-only
 causal LM (Llama Guard 3 8B, 32 layers, hidden_dim=4096) attacked via
 examples/llama_guard.py (which saves per-prompt .pt files).
 
+Measurement site (--site):
+  pre_silu (default): MLP gate_proj output — i.e. the vector that gets
+      the SiLU non-linearity applied element-wise. This is where LAT
+      variants like "malatang" inject PGD perturbations, so matching
+      the calibration to the perturbation site keeps the eps numbers
+      comparable across threat model and training budget. Dim =
+      intermediate_size (14336 for Llama-3-8B).
+  residual: the transformer block's output (post-attention, post-MLP,
+      post-residual). Useful if you're doing residual-stream LAT.
+      Dim = hidden_size (4096).
+
 For each successful attack we do two forward passes — one on the clean
-prompt ids and one on the attacked prompt ids — hook every transformer
-layer, and compare activations. Because attention is causal and the two
-inputs share a prefix up to where the suffix is inserted, the
-activations are identical there; the interesting shift happens from
-that divergence point onward (and at suffix positions, which exist
-only in the attacked input).
+prompt ids and one on the attacked prompt ids — hook the selected site
+at every transformer layer, and compare activations. Because attention
+is causal and the two inputs share a prefix up to where the suffix is
+inserted, the activations are identical there; the interesting shift
+happens from that divergence point onward (and at suffix positions,
+which exist only in the attacked input).
 
 Alignment (important — different from the BERT script):
   clean: [taxonomy prefix | user prompt | taxonomy end + <|eot|>...]
@@ -65,26 +76,48 @@ def get_llama_layers(model):
     raise RuntimeError(f"Could not find .layers on {type(model).__name__}")
 
 
-def capture_all(model, layers, input_ids):
-    """Forward pass; return dict of key -> hidden_states (1, seq, dim).
+def pick_target_module(layer, site: str):
+    """Return the submodule to hook for the chosen measurement site."""
+    if site == "pre_silu":
+        # Llama MLP: down_proj(silu(gate_proj(x)) * up_proj(x)).
+        # gate_proj's output is the tensor fed into SiLU — this is the
+        # "pre-activation" vector that pre-GeLU-style LAT schemes (e.g.
+        # malatang) inject perturbations into. Dim = intermediate_size.
+        return layer.mlp.gate_proj
+    if site == "residual":
+        # Whole decoder block — its forward returns (hidden_states, ...)
+        # where hidden_states is the post-residual output (hidden_size dim).
+        return layer
+    raise ValueError(f"unknown --site: {site!r}")
 
-    key == "embed" for the input-embeddings output and the integer
-    layer index for each transformer block's output.
+
+def capture_all(model, layers, input_ids, site: str):
+    """Forward pass; return dict of layer_idx -> activations (1, seq, dim).
+
+    For site='pre_silu' the dim is intermediate_size (14336); for
+    site='residual' it's hidden_size (4096). Only layer indices are
+    keyed — there's no 'embed' entry for pre-SiLU since there's no
+    corresponding pre-activation at the input embedding.
     """
     captured: Dict = {}
 
-    def emb_hook(_m, _i, out):
-        captured["embed"] = out.detach().clone()
-
-    def make_layer_hook(idx):
+    def make_hook(idx, is_residual):
         def h(_m, _i, out):
-            # Llama decoder layer returns (hidden_states, ...) tuples.
-            captured[idx] = (out[0] if isinstance(out, tuple) else out).detach().clone()
+            if is_residual and isinstance(out, tuple):
+                out = out[0]
+            captured[idx] = out.detach().clone()
         return h
 
-    hooks = [model.get_input_embeddings().register_forward_hook(emb_hook)]
+    hooks = []
+    is_residual = (site == "residual")
+    if is_residual:
+        # Only applicable for residual-stream comparisons.
+        def emb_hook(_m, _i, out):
+            captured["embed"] = (out[0] if isinstance(out, tuple) else out).detach().clone()
+        hooks.append(model.get_input_embeddings().register_forward_hook(emb_hook))
     for idx, layer in enumerate(layers):
-        hooks.append(layer.register_forward_hook(make_layer_hook(idx)))
+        mod = pick_target_module(layer, site)
+        hooks.append(mod.register_forward_hook(make_hook(idx, is_residual)))
 
     with torch.no_grad():
         model(input_ids=input_ids.unsqueeze(0).to(model.device))
@@ -135,6 +168,11 @@ def main():
                     "LAT attacks through the base model gives meaningless activations).")
     ap.add_argument("--dtype", type=str, default="bfloat16")
     ap.add_argument("--device-map", type=str, default="auto")
+    ap.add_argument("--site", choices=["pre_silu", "residual"], default="pre_silu",
+                    help="Where to measure activations. 'pre_silu' hooks each layer's "
+                    "MLP gate_proj output (the thing SiLU is applied to; dim=14336); "
+                    "'residual' hooks the whole transformer block output (dim=4096). "
+                    "Default pre_silu — matches malatang-style PGD injection site.")
     ap.add_argument("--max-n", type=int, default=None,
                     help="Cap how many successful attacks to process (for quick tests).")
     ap.add_argument("--output-json", type=str, default=None,
@@ -171,9 +209,12 @@ def main():
 
     layers = get_llama_layers(model)
     num_layers = len(layers)
-    print(f"[eps] found {num_layers} transformer layers")
+    site = args.site
+    print(f"[eps] found {num_layers} transformer layers; measuring site={site!r}")
 
-    keys: List = ["embed"] + list(range(num_layers))
+    # 'embed' key only makes sense for residual-stream measurements — pre-SiLU
+    # doesn't have a corresponding "pre-activation" at the input embedding.
+    keys: List = (["embed"] + list(range(num_layers))) if site == "residual" else list(range(num_layers))
     stats = {k: {
         # Diff stats on ALIGNED shifted-content positions (same tokens, different
         # activations due to suffix in past).
@@ -213,8 +254,8 @@ def main():
             print(f"  skip {atk.get('_path')}: divergence >= n_clean (div={div}, n_c={n_c})")
             continue
 
-        clean_acts = capture_all(model, layers, prompt_ids)
-        adv_acts = capture_all(model, layers, adv_ids)
+        clean_acts = capture_all(model, layers, prompt_ids, site)
+        adv_acts = capture_all(model, layers, adv_ids, site)
 
         # Expected alignment for "same tokens, shifted past":
         #   adv_ids[div + n_s : n_a]  == prompt_ids[div : n_c]  (element-wise)
@@ -294,12 +335,13 @@ def main():
     # ==================== Print tables ====================
     tag = "base" if args.adapter_path is None else "LAT"
     print(f"\n{'=' * 90}")
-    print(f"LLAMA GUARD ACTIVATION SHIFTS — {tag}")
+    print(f"LLAMA GUARD ACTIVATION SHIFTS — {tag}  site={site}")
     print(f"{'=' * 90}")
-    print(f"  Model: {args.model}")
+    print(f"  Model:   {args.model}")
     print(f"  Adapter: {args.adapter_path or '<none>'}")
-    print(f"  Records:  {n_used} successful attacks")
-    print(f"  Layers:   {num_layers}")
+    print(f"  Site:    {site}  ({'gate_proj output, pre-SiLU, dim=14336' if site == 'pre_silu' else 'block output, residual stream, dim=4096'})")
+    print(f"  Records: {n_used} successful attacks")
+    print(f"  Layers:  {num_layers}")
 
     def label(k):
         return f"L{k:02d}" if isinstance(k, int) else "Embed"
@@ -372,6 +414,7 @@ def main():
         payload = {
             "model": args.model,
             "adapter_path": args.adapter_path,
+            "site": site,
             "num_layers": num_layers,
             "n_used": n_used,
             "summary": summary,
