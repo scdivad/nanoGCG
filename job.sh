@@ -128,6 +128,15 @@ if [ -n "$INIT_FROM_JSONL" ]; then
     echo "[job] init-from-jsonl -> $INIT_FROM_JSONL"
 fi
 
+# Optional: cap the number of prompts attacked. Useful for pilot runs.
+#   LIMIT=100 sbatch job.sh
+LIMIT="${LIMIT:-}"
+LIMIT_FLAG=()
+if [ -n "$LIMIT" ]; then
+    LIMIT_FLAG=(--limit "$LIMIT")
+    echo "[job] limit -> $LIMIT prompts"
+fi
+
 # Disable nanogcg's token-space early_stop (false-positives on Llama 3's BPE
 # boundary) and use --verify-every instead: every K steps the driver decodes
 # the current best suffix, runs the real Llama Guard classification pipeline,
@@ -145,6 +154,7 @@ python -u examples/llama_guard.py \
     --skip-already-safe \
     "${RESUME_FLAG[@]}" \
     "${INIT_FROM_FLAG[@]}" \
+    "${LIMIT_FLAG[@]}" \
     --seed 0 \
     --verbosity WARNING
 
