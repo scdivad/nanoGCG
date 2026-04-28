@@ -489,13 +489,20 @@ def save_pt_record(
     }
 
     if gcg_result is not None:
-        step_ids = []
-        for s in gcg_result.strings:
-            ids = tokenizer(s, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
-            step_ids.append(ids)
-        # Stack into [num_steps, suffix_len]. All steps share the same suffix
-        # length (nanogcg never changes optim_str length mid-run).
-        payload["all_suffix_ids"] = torch.stack(step_ids, dim=0).cpu()
+        # Re-tokenize each step's suffix string. nanogcg never changes
+        # optim_str length internally, but a few step strings can re-encode
+        # to a different length here when special tokens (e.g. Llama 3's
+        # <|reserved_special_token_*|>) slip through filter_ids — those are
+        # printable ASCII so they round-trip via decode/encode of raw bytes,
+        # but a fresh tokenizer call merges the literal "<|...|>" string
+        # into the single special-token id, yielding a shorter sequence.
+        # Store as a list of variable-length tensors instead of stacking,
+        # so the trajectory is preserved losslessly.
+        step_ids = [
+            tokenizer(s, add_special_tokens=False, return_tensors="pt")["input_ids"][0].cpu()
+            for s in gcg_result.strings
+        ]
+        payload["all_suffix_ids"] = step_ids        # list[LongTensor]
         payload["all_losses"] = gcg_result.losses
 
     path = pt_dir / f"prompt_{idx:03d}.pt"
