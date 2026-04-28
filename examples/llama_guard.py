@@ -426,6 +426,7 @@ def save_pt_record(
     record: dict,
     target: str,
     mode: str,
+    gcg_result=None,
 ) -> Path:
     """Persist tokenized prompt/attacked_prompt + metadata to .pt.
 
@@ -434,6 +435,14 @@ def save_pt_record(
     to re-render the chat template or worry about re-tokenization drift at
     the prompt/suffix boundary. Also saves the raw suffix ids (as nanogcg
     saw them during optimization) and the string forms for convenience.
+
+    If gcg_result is provided (a GCGResult from nanogcg.run), also saves
+    the full per-step trajectory:
+      all_suffix_ids : LongTensor[num_steps, suffix_len]  — token IDs per step
+      all_losses     : list[float]                        — loss per step
+    Each step's string is re-tokenized (safe because filter_ids=True ensures
+    round-trip fidelity). Use all_suffix_ids[step] to replay any intermediate
+    suffix without going through string decoding.
     """
     import torch  # local import so nothing imports torch twice unnecessarily
 
@@ -478,6 +487,17 @@ def save_pt_record(
         "adv_position": record.get("adv_position", "suffix"),
         "tokenizer_name_or_path": getattr(tokenizer, "name_or_path", ""),
     }
+
+    if gcg_result is not None:
+        step_ids = []
+        for s in gcg_result.strings:
+            ids = tokenizer(s, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+            step_ids.append(ids)
+        # Stack into [num_steps, suffix_len]. All steps share the same suffix
+        # length (nanogcg never changes optim_str length mid-run).
+        payload["all_suffix_ids"] = torch.stack(step_ids, dim=0).cpu()
+        payload["all_losses"] = gcg_result.losses
+
     path = pt_dir / f"prompt_{idx:03d}.pt"
     torch.save(payload, path)
     return path
@@ -525,8 +545,12 @@ def attack_one(
     config: GCGConfig,
     verify_every: int = 0,
     adv_position: str = "suffix",
-) -> dict:
-    """Run one attack and return a structured result."""
+) -> tuple:
+    """Run one attack and return (record_dict, gcg_result).
+
+    gcg_result carries result.strings (one per step) and result.losses,
+    used by save_pt_record to store the full per-step trajectory.
+    """
     pre = classify(model, tokenizer, prompt)
 
     if verify_every > 0:
@@ -582,7 +606,7 @@ def attack_one(
         "num_steps_run": len(result.losses),
         "success": success,
         "elapsed_sec": elapsed,
-    }
+    }, result
 
 
 def main() -> None:
@@ -685,7 +709,7 @@ def main() -> None:
                     continue
 
             try:
-                record = attack_one(
+                record, gcg_result = attack_one(
                     model, tokenizer, prompt, args.target, config,
                     verify_every=args.verify_every,
                     adv_position=args.adv_position,
@@ -735,7 +759,8 @@ def main() -> None:
 
             if pt_dir:
                 pt_path = save_pt_record(
-                    pt_dir, idx, tokenizer, prompt, record, args.target, args.mode
+                    pt_dir, idx, tokenizer, prompt, record, args.target, args.mode,
+                    gcg_result=gcg_result,
                 )
                 print(f"Saved .pt: {pt_path}")
     finally:
