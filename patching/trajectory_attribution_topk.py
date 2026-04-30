@@ -64,7 +64,8 @@ from patch_sweep import align_suffix_positions
 from mlp_sparse_patch import linearized_for_backward
 
 
-K_VALUES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 14336]
+K_VALUES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+            16384, 32768, 65536]
 TAU_LEVELS = [0.0, 0.25, 0.5]   # plus implicit "final-only" baseline
 TAU_NAMES  = {0.0: "all", 0.25: "tau25", 0.5: "tau50"}
 
@@ -374,41 +375,51 @@ def main():
           f"{len(prompt_meta)} prompts kept.")
 
     # --------------------------------------------------------------------
-    # Build per-(ranking, tau, layer) global attribution = mean across
-    # prompts of per-prompt mean attribution. Then rank.
+    # Aggregate to global per-(L, n) attribution = mean across prompts of
+    # per-prompt mean attribution. Then sort across all (L, n) tuples
+    # globally to build a single top-K ranking per (ranking_method, tau).
+    # Matches the BERT-pipeline cluster_neurons_attribution_topk.py:
+    # one cumulative top-K curve, neurons can come from any layer.
     # --------------------------------------------------------------------
-    rankings = {r: {tl: {} for tl in TAU_LABELS} for r in rankings_to_run}
-    scores   = {r: {tl: {} for tl in TAU_LABELS} for r in rankings_to_run}
+    n_layers_used = len(target_layers)
+    L_to_idx = {L: i for i, L in enumerate(target_layers)}
 
+    global_scores = {r: {} for r in rankings_to_run}
     for r in rankings_to_run:
         for tl in TAU_LABELS:
-            stacks = {L: [] for L in target_layers}
+            mat = torch.zeros(n_layers_used, inter_size, dtype=torch.float32)
+            n_seen = 0
             for slot in accum[r][tl]:
                 if slot is None:
                     continue
+                n_seen += 1
                 for L in target_layers:
-                    stacks[L].append(slot[L])
-            for L in target_layers:
-                if not stacks[L]:
-                    rankings[r][tl][L] = torch.arange(inter_size)
-                    scores[r][tl][L]   = torch.zeros(inter_size)
-                    continue
-                mean_attr = torch.stack(stacks[L], dim=0).mean(dim=0)
-                # AP convention from mlp_sparse_patch.py:
-                #   sort ascending => most-negative first => patching toward
-                #   clean decreases f(=safe-pref) most, i.e. RECOVERY toward
-                #   the unsafe-classifying clean value.
-                # RelP convention: sort descending (most positive => largest
-                #   contribution to f).
-                if r == "attr":
-                    rankings[r][tl][L] = torch.argsort(mean_attr, descending=False)
-                else:
-                    rankings[r][tl][L] = torch.argsort(mean_attr, descending=True)
-                scores[r][tl][L] = mean_attr
+                    mat[L_to_idx[L]] += slot[L]
+            if n_seen > 0:
+                mat /= n_seen
+            global_scores[r][tl] = mat
+
+    # Convention (matches mlp_sparse_patch.py for fair comparison):
+    #   AP   -> argsort ascending  (most-negative first; patching these
+    #           neurons toward clean decreases the safe-vs-unsafe margin
+    #           the most, i.e. recovers toward the unsafe-classifying clean)
+    #   RelP -> argsort descending (most-positive first)
+    global_rankings = {r: {} for r in rankings_to_run}
+    for r in rankings_to_run:
+        descending = (r == "relp")
+        for tl in TAU_LABELS:
+            flat = global_scores[r][tl].flatten()      # [n_layers_used * inter_size]
+            order = torch.argsort(flat, descending=descending)
+            Ls_idx = (order // inter_size).tolist()
+            ns     = (order %  inter_size).tolist()
+            global_rankings[r][tl] = list(zip(
+                [target_layers[i] for i in Ls_idx], ns
+            ))
 
     # --------------------------------------------------------------------
-    # Recovery sweep: patch top-K of each (ranking, tau, L) on the FINAL
-    # attacked state, measure recovery. Same convention as mlp_sparse_patch.py.
+    # Global recovery sweep: for each (ranking, tau, K), group the top-K
+    # (L, n) entries by layer and patch all involved layers in ONE forward
+    # pass per prompt.
     # --------------------------------------------------------------------
     patch_state = {L: None for L in target_layers}
 
@@ -429,33 +440,49 @@ def main():
         h = model.model.layers[L].mlp.down_proj.register_forward_pre_hook(make_patch(L))
         patch_handles.append(h)
 
-    recovery = {r: {tl: {L: {k: [] for k in K_VALUES} for L in target_layers}
-                    for tl in TAU_LABELS} for r in rankings_to_run}
+    recovery = {r: {tl: {k: [] for k in K_VALUES} for tl in TAU_LABELS}
+                for r in rankings_to_run}
+    layer_hits = {r: {tl: {k: {} for k in K_VALUES} for tl in TAU_LABELS}
+                  for r in rankings_to_run}
     sweep_t0 = time.time()
     for r in rankings_to_run:
         for tl in TAU_LABELS:
-            for L in target_layers:
-                neurons_sorted = rankings[r][tl][L].to(dev)
+            ranking = global_rankings[r][tl]
+            for k in K_VALUES:
+                k_eff = min(k, len(ranking))
+                topk = ranking[:k_eff]
+                by_layer = {L: [] for L in target_layers}
+                for (L, n) in topk:
+                    by_layer[L].append(n)
+                by_layer_t = {L: torch.tensor(by_layer[L], device=dev, dtype=torch.long)
+                              for L in target_layers if by_layer[L]}
+                layer_hits[r][tl][k] = {L: len(by_layer[L]) for L in target_layers if by_layer[L]}
+
                 for prompt_idx, meta in enumerate(prompt_meta):
                     atk_ids = meta["attacked_full"]
                     sp = torch.tensor(meta["s_positions"], device=dev, dtype=torch.long)
-                    clean_full = clean_acts[prompt_idx][L].to(dev, dtype=torch.bfloat16)
-                    for k in K_VALUES:
-                        k_eff = min(k, inter_size)
-                        neurons_k = neurons_sorted[:k_eff]
-                        clean_slice = clean_full[:, neurons_k]
-                        patch_state[L] = (sp, neurons_k, clean_slice)
-                        try:
-                            with torch.no_grad():
-                                p_logits = model(atk_ids).logits
-                            p_diff = logit_diff(p_logits, SAFE_TOK, UNSAFE_TOK)
-                        finally:
+                    for L in target_layers:
+                        if L in by_layer_t:
+                            neurons_t = by_layer_t[L]
+                            clean_full = clean_acts[prompt_idx][L].to(dev, dtype=torch.bfloat16)
+                            patch_state[L] = (sp, neurons_t, clean_full[:, neurons_t])
+                        else:
                             patch_state[L] = None
-                        gap = meta["gap"]
-                        rec = (meta["corr_diff"] - p_diff) / gap if abs(gap) > 1e-6 else 0.0
-                        recovery[r][tl][L][k].append(rec)
-                print(f"  [recovery] r={r} tau={tl} L={L:2d}: done at "
-                      f"{time.time() - sweep_t0:.0f}s", flush=True)
+                    try:
+                        with torch.no_grad():
+                            p_logits = model(atk_ids).logits
+                        p_diff = logit_diff(p_logits, SAFE_TOK, UNSAFE_TOK)
+                    finally:
+                        for L in target_layers:
+                            patch_state[L] = None
+                    gap = meta["gap"]
+                    rec = (meta["corr_diff"] - p_diff) / gap if abs(gap) > 1e-6 else 0.0
+                    recovery[r][tl][k].append(rec)
+                hit_layers = sorted(layer_hits[r][tl][k].keys())
+                print(f"  [recovery] r={r} tau={tl} K={k:>6d}: "
+                      f"hit_layers={hit_layers}  "
+                      f"mean_rec={np.mean(recovery[r][tl][k]):+.3f}  "
+                      f"({time.time() - sweep_t0:.0f}s)", flush=True)
     for h in patch_handles:
         h.remove()
 
@@ -471,21 +498,22 @@ def main():
         "rankings":   rankings_to_run,
         "intermediate_size": inter_size,
         "mean_recovery": {
-            r: {tl: {L: {k: float(np.mean(recovery[r][tl][L][k])) for k in K_VALUES}
-                     for L in target_layers}
+            r: {tl: {k: float(np.mean(recovery[r][tl][k])) for k in K_VALUES}
                 for tl in TAU_LABELS}
             for r in rankings_to_run
         },
         "std_recovery": {
-            r: {tl: {L: {k: float(np.std(recovery[r][tl][L][k])) for k in K_VALUES}
-                     for L in target_layers}
+            r: {tl: {k: float(np.std(recovery[r][tl][k])) for k in K_VALUES}
                 for tl in TAU_LABELS}
             for r in rankings_to_run
         },
-        "top_neurons_by_layer": {
-            r: {tl: {L: rankings[r][tl][L][:64].cpu().tolist()
-                     for L in target_layers}
+        "layer_hits_at_K": {
+            r: {tl: {k: layer_hits[r][tl][k] for k in K_VALUES}
                 for tl in TAU_LABELS}
+            for r in rankings_to_run
+        },
+        "top_global_by_tau": {
+            r: {tl: global_rankings[r][tl][:128] for tl in TAU_LABELS}
             for r in rankings_to_run
         },
         "per_prompt": [
@@ -506,49 +534,41 @@ def main():
     print(f"Wrote {out_json}")
 
     # --------------------------------------------------------------------
-    # Plot: one subplot per layer, one curve per tau bucket (per ranking)
+    # Plot: ONE figure per ranking method. Single panel, x = K (log scale),
+    # y = recovery, four curves (final-only / all / tau25 / tau50).
     # --------------------------------------------------------------------
-    n = len(target_layers)
-    cols = min(3, n)
-    rows = (n + cols - 1) // cols
     tau_colors = {"final": "#888888", "all": "#1f77b4", "tau25": "#2ca02c", "tau50": "#d62728"}
-    tau_label_str = {"final": "final-only (N=Nprompts)",
-                     "all": "all unique steps (τ=0)",
-                     "tau25": "τ ≥ 0.25",
-                     "tau50": "τ ≥ 0.5"}
+    tau_label_str = {"final": "final-only (N attribution states = N prompts)",
+                     "all":   "all unique trajectory states (τ ≥ 0)",
+                     "tau25": "trajectory, τ ≥ 0.25",
+                     "tau50": "trajectory, τ ≥ 0.50"}
 
     for r in rankings_to_run:
-        fig, axes = plt.subplots(rows, cols, figsize=(5.5 * cols, 4.2 * rows), sharey=True)
-        axes = np.array(axes).flatten()
+        fig, ax = plt.subplots(1, 1, figsize=(8.5, 5.5))
         xs = np.array(K_VALUES)
-        for i, L in enumerate(target_layers):
-            ax = axes[i]
-            for tl in TAU_LABELS:
-                mean = np.array([np.mean(recovery[r][tl][L][k]) for k in K_VALUES])
-                std  = np.array([np.std(recovery[r][tl][L][k])  for k in K_VALUES])
-                ax.plot(xs, mean, marker="o", markersize=4, linewidth=1.8,
-                        color=tau_colors[tl], label=tau_label_str[tl])
-                ax.fill_between(xs, mean - std, mean + std,
-                                color=tau_colors[tl], alpha=0.10)
-            ax.axhline(0, color="gray", linewidth=0.5, linestyle=":")
-            ax.axhline(1, color="gray", linewidth=0.5, linestyle=":")
-            ax.set_xscale("log", base=2)
-            ax.set_xlabel("k (top-k neurons patched at suffix positions)")
-            ax.set_title(f"Layer {L}", fontsize=10)
-            ax.grid(True, alpha=0.3, which="both")
-            if i % cols == 0:
-                ax.set_ylabel("Recovery toward clean logit-diff")
-            ax.legend(loc="lower right", fontsize=7)
-        for j in range(n, len(axes)):
-            axes[j].set_visible(False)
-        fig.suptitle(
-            f"Trajectory-augmented MLP attribution patching, ranking={r}\n"
+        for tl in TAU_LABELS:
+            mean = np.array([np.mean(recovery[r][tl][k]) for k in K_VALUES])
+            std  = np.array([np.std(recovery[r][tl][k])  for k in K_VALUES])
+            ax.plot(xs, mean, marker="o", markersize=4, linewidth=1.8,
+                    color=tau_colors[tl], label=tau_label_str[tl])
+            ax.fill_between(xs, mean - std, mean + std,
+                            color=tau_colors[tl], alpha=0.10)
+        ax.axhline(0, color="gray", linewidth=0.5, linestyle=":")
+        ax.axhline(1, color="gray", linewidth=0.5, linestyle=":")
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("K (top-K MLP neurons patched globally across layers "
+                      f"{target_layers[0]}..{target_layers[-1]})")
+        ax.set_ylabel("Recovery toward clean logit-diff")
+        ax.grid(True, alpha=0.3, which="both")
+        ax.legend(loc="lower right", fontsize=9)
+        ax.set_title(
+            f"Trajectory-augmented MLP attribution patching ({r}) — global top-K\n"
             f"N_prompts={len(prompt_meta)}; per-prompt-normalised attribution; "
-            f"recovery measured on FINAL attacked state",
-            fontsize=11,
+            f"recovery on FINAL attacked state",
+            fontsize=10,
         )
         fig.tight_layout()
-        out_png = out_dir / f"trajectory_attribution_recovery_{r}.png"
+        out_png = out_dir / f"trajectory_attribution_recovery_{r}_global.png"
         fig.savefig(out_png, dpi=140, bbox_inches="tight")
         print(f"Wrote {out_png}")
 
