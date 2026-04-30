@@ -112,6 +112,12 @@ def main():
     ap.add_argument("--include-unsafe-unsafe", action="store_true",
                     help="Include attacks that ended unsafe (different "
                     "category) in addition to unsafe->safe.")
+    ap.add_argument("--no-verdict-prefix", action="store_true",
+                    help="Do NOT append '\\n\\n' before reading the verdict "
+                    "logits. Use this for Llama Guard 1, which emits "
+                    "safe/unsafe directly after [/INST] with no leading "
+                    "newlines. Default behaviour (LG3) appends '\\n\\n' to "
+                    "set the verdict-predicting position.")
     args = ap.parse_args()
     rankings_to_run = [r.strip() for r in args.rankings.split(",") if r.strip()]
 
@@ -156,6 +162,17 @@ def main():
     SAFE_TOK    = tok("safe",   add_special_tokens=False).input_ids[0]
     UNSAFE_TOK  = tok("unsafe", add_special_tokens=False).input_ids[0]
     FILLER_TOK  = tok("!",      add_special_tokens=False).input_ids[0]
+    print(f"  SAFE_TOK={SAFE_TOK}  UNSAFE_TOK={UNSAFE_TOK}  "
+          f"FILLER_TOK={FILLER_TOK}  NEWLINE_TOK={NEWLINE_TOK}  "
+          f"verdict_prefix={'(none, LG1)' if args.no_verdict_prefix else 'newline (LG3)'}")
+
+    def _wrap_for_verdict(raw_ids_1d):
+        """Build the model-input tensor whose final position predicts the
+        verdict token. For LG3 we append '\\n\\n'; for LG1 (no prefix) the
+        verdict is emitted right after [/INST], so use the raw ids as-is."""
+        if args.no_verdict_prefix:
+            return raw_ids_1d.unsqueeze(0).to(dev)
+        return torch.cat([raw_ids_1d, torch.tensor([NEWLINE_TOK])]).unsqueeze(0).to(dev)
 
     # --------------------------------------------------------------------
     # Per-prompt attribution accumulators: one per (ranking, tau, prompt, L).
@@ -179,8 +196,9 @@ def main():
             all_suff = [all_suff]
         all_suff = [to_long_1d(s) for s in all_suff]
 
-        # Suffix positions in attacked (without the appended verdict newline)
-        attacked_full = torch.cat([attacked_raw, torch.tensor([NEWLINE_TOK])]).unsqueeze(0).to(dev)
+        # Verdict-position-bearing input. For LG3 we append '\n\n'; for
+        # LG1 the [/INST] tail already terminates the model's input.
+        attacked_full = _wrap_for_verdict(attacked_raw)
         total_len = attacked_full.shape[1]
         s_positions, _ = compute_positions(tok, prompt_ids, attacked_raw, total_len)
         if not s_positions:
@@ -193,7 +211,7 @@ def main():
         # Length-matched filler clean baseline on the FINAL attacked seq
         benign_raw = attacked_raw.clone()
         benign_raw[s_start:s_end] = FILLER_TOK
-        benign_full = torch.cat([benign_raw, torch.tensor([NEWLINE_TOK])]).unsqueeze(0).to(dev)
+        benign_full = _wrap_for_verdict(benign_raw)
 
         # Capture clean activations at suffix positions
         cap = {}
@@ -238,7 +256,7 @@ def main():
                 continue
             inter_raw = attacked_raw.clone()
             inter_raw[s_start:s_end] = suf
-            inter_full = torch.cat([inter_raw, torch.tensor([NEWLINE_TOK])]).unsqueeze(0).to(dev)
+            inter_full = _wrap_for_verdict(inter_raw)
             unique_states[key] = {"ids_full": inter_full, "is_final": False}
 
         final_suf_1d = attacked_raw[s_start:s_end].clone()

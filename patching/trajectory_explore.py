@@ -60,6 +60,10 @@ def main():
                     help="Also evaluate attacked_prompt_ids itself as a "
                     "step (labelled 'final'); useful for sanity-checking "
                     "that all_suffix_ids[-1] reproduces the saved final.")
+    ap.add_argument("--no-verdict-prefix", action="store_true",
+                    help="Skip the '\\n\\n' append before reading verdict "
+                    "logits. Use for Llama Guard 1 (verdict emitted "
+                    "directly after [/INST]).")
     args = ap.parse_args()
 
     pt_dir = Path(args.pt_dir)
@@ -100,9 +104,13 @@ def main():
 
     @torch.no_grad()
     def fwd_diff(ids_1d):
-        """ids_1d: 1-D LongTensor (no batch). Append '\\n\\n', forward,
-        return logit(safe) - logit(unsafe) at the final position."""
-        ids = torch.cat([ids_1d, torch.tensor([NEWLINE_TOK])]).unsqueeze(0).to(dev)
+        """ids_1d: 1-D LongTensor (no batch). For LG3 append '\\n\\n' to
+        set the verdict-predicting position; for LG1 use the ids as-is.
+        Return logit(safe) - logit(unsafe) at the final position."""
+        if args.no_verdict_prefix:
+            ids = ids_1d.unsqueeze(0).to(dev)
+        else:
+            ids = torch.cat([ids_1d, torch.tensor([NEWLINE_TOK])]).unsqueeze(0).to(dev)
         out = model(input_ids=ids).logits
         return float(out[0, -1, SAFE_TOK] - out[0, -1, UNSAFE_TOK])
 
