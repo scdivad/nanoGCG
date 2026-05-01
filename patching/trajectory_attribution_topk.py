@@ -48,6 +48,7 @@ import argparse
 import json
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -196,8 +197,10 @@ def main():
             all_suff = [all_suff]
         all_suff = [to_long_1d(s) for s in all_suff]
 
-        # Verdict-position-bearing input. For LG3 we append '\n\n'; for
-        # LG1 the [/INST] tail already terminates the model's input.
+        # SAVED final attacked input — used for recovery measurement and
+        # for the 'final' attribution bucket. Has the BPE-merged boundary
+        # tokenisation the tokenizer produced when re-tokenising
+        # prompt_text + suffix_text together.
         attacked_full = _wrap_for_verdict(attacked_raw)
         total_len = attacked_full.shape[1]
         s_positions, _ = compute_positions(tok, prompt_ids, attacked_raw, total_len)
@@ -205,15 +208,44 @@ def main():
             print(f"  [{pi}] {pt_path.name}: no suffix positions; skip")
             continue
         s_start, s_end = align_suffix_positions(prompt_ids, attacked_raw)
-        suffix_len = s_end - s_start
+        saved_suffix_len = s_end - s_start
         sp = torch.tensor(s_positions, device=dev, dtype=torch.long)
 
-        # Length-matched filler clean baseline on the FINAL attacked seq
+        # Per-step CANONICAL splice setup. all_suffix_ids[t] is the
+        # GCG-canonical 20-token suffix; the saved attacked may have an
+        # extra boundary BPE token (saved_suffix_len = 21 for ~half the
+        # LG1 ACG prompts). Splice prefix + suf + tail produces a
+        # canonical-shape input for which we re-derive s_positions.
+        # All per-step canonical inputs share one shape, so capture clean
+        # activations + s_positions ONCE per prompt.
+        prefix_ids = attacked_raw[:s_start].clone()
+        tail_ids   = attacked_raw[s_end:].clone()
+        len_counts = Counter(s.numel() for s in all_suff)
+        canonical_suffix_len, _ = len_counts.most_common(1)[0]
+
+        canonical_filler_raw = torch.cat([
+            prefix_ids,
+            torch.full((canonical_suffix_len,), FILLER_TOK, dtype=torch.long),
+            tail_ids,
+        ])
+        canonical_filler_full = _wrap_for_verdict(canonical_filler_raw)
+        canonical_total_len = canonical_filler_full.shape[1]
+        canonical_s_positions, _ = compute_positions(
+            tok, prompt_ids, canonical_filler_raw, canonical_total_len
+        )
+        if not canonical_s_positions:
+            print(f"  [{pi}] {pt_path.name}: no canonical s_positions; "
+                  f"skip per-step states (FINAL only)")
+            canonical_sp = None
+            clean_at_sp_can = None
+            clean_diff_can = None
+        else:
+            canonical_sp = torch.tensor(canonical_s_positions, device=dev, dtype=torch.long)
+
+        # FINAL clean baseline + activations (saved shape, saved s_positions)
         benign_raw = attacked_raw.clone()
         benign_raw[s_start:s_end] = FILLER_TOK
         benign_full = _wrap_for_verdict(benign_raw)
-
-        # Capture clean activations at suffix positions
         cap = {}
         handles = [model.model.layers[L].mlp.down_proj.register_forward_pre_hook(
                        make_capture_nograd(L, cap)) for L in target_layers]
@@ -222,6 +254,17 @@ def main():
         clean_diff = logit_diff(cl_logits, SAFE_TOK, UNSAFE_TOK)
         clean_at_sp = {L: cap[L][0, sp, :].detach().cpu() for L in target_layers}
         for h in handles: h.remove()
+
+        # CANONICAL clean baseline + activations (canonical shape, canonical s_positions)
+        if canonical_sp is not None:
+            cap = {}
+            handles = [model.model.layers[L].mlp.down_proj.register_forward_pre_hook(
+                           make_capture_nograd(L, cap)) for L in target_layers]
+            with torch.no_grad():
+                cl_logits_can = model(canonical_filler_full).logits
+            clean_diff_can = logit_diff(cl_logits_can, SAFE_TOK, UNSAFE_TOK)
+            clean_at_sp_can = {L: cap[L][0, canonical_sp, :].detach().cpu() for L in target_layers}
+            for h in handles: h.remove()
 
         # Final attacked diff (for gap and for recovery measurement)
         with torch.no_grad():
@@ -239,39 +282,46 @@ def main():
         per_prompt_n = {r: {tl: 0 for tl in TAU_LABELS} for r in rankings_to_run}
 
         # Build the unique-states list with global suffix-identity dedup.
-        # The FINAL attacked suffix (= best_suffix used to build
-        # attacked_prompt_ids) may or may not appear verbatim in
-        # all_suffix_ids — track it separately so it always lands in the
-        # 'final' bucket.
-        unique_states = {}      # tuple(int) -> {"ids_full":..., "is_final":bool}
+        # Per-step states splice prefix + suf + tail (canonical shape) so
+        # bad_lens prompts are recovered. The SAVED FINAL is added as a
+        # separate state with its own (saved) shape and s_positions.
+        unique_states = {}      # tuple(int) -> dict
         bad_lens = 0
         n_dup = 0
-        for t, suf in enumerate(all_suff):
-            if suf.numel() != suffix_len:
-                bad_lens += 1
-                continue
-            key = tuple(int(x) for x in suf.tolist())
-            if key in unique_states:
-                n_dup += 1
-                continue
-            inter_raw = attacked_raw.clone()
-            inter_raw[s_start:s_end] = suf
-            inter_full = _wrap_for_verdict(inter_raw)
-            unique_states[key] = {"ids_full": inter_full, "is_final": False}
+        if canonical_sp is not None:
+            for t, suf in enumerate(all_suff):
+                if suf.numel() != canonical_suffix_len:
+                    bad_lens += 1
+                    continue
+                key = tuple(int(x) for x in suf.tolist())
+                if key in unique_states:
+                    n_dup += 1
+                    continue
+                inter_raw = torch.cat([prefix_ids, suf, tail_ids])
+                inter_full = _wrap_for_verdict(inter_raw)
+                unique_states[key] = {"ids_full": inter_full,
+                                      "is_final": False, "shape": "canonical"}
 
-        final_suf_1d = attacked_raw[s_start:s_end].clone()
-        final_key = tuple(int(x) for x in final_suf_1d.tolist())
-        if final_key in unique_states:
-            unique_states[final_key]["is_final"] = True
-        else:
-            unique_states[final_key] = {"ids_full": attacked_full, "is_final": True}
+        # SAVED FINAL state (always added, its own shape)
+        unique_states["__SAVED_FINAL__"] = {"ids_full": attacked_full,
+                                            "is_final": True, "shape": "saved"}
         steps_to_process = [
-            ("final" if v["is_final"] else "step", v["ids_full"], v["is_final"])
-            for v in unique_states.values()
+            (k, v["ids_full"], v["is_final"], v["shape"])
+            for k, v in unique_states.items()
         ]
 
         n_attr_passes = 0
-        for label, inter_full, is_final in steps_to_process:
+        for label, inter_full, is_final, shape in steps_to_process:
+            # Pick the right s_positions + clean activations + clean_diff
+            if shape == "saved":
+                use_sp = sp
+                use_clean_at_sp = clean_at_sp
+                use_clean_diff = clean_diff
+            else:   # "canonical"
+                use_sp = canonical_sp
+                use_clean_at_sp = clean_at_sp_can
+                use_clean_diff = clean_diff_can
+
             # Forward to compute inter_diff (also reused for AP backward)
             cap_g = {}
             handles = [model.model.layers[L].mlp.down_proj.register_forward_pre_hook(
@@ -283,6 +333,8 @@ def main():
             inter_diff = float(margin_t.detach())
             for h in handles: h.remove()
 
+            # gap_frac uses the SAVED gap as reference for all states so
+            # final-only and trajectory buckets are on a comparable scale.
             gap_frac = (inter_diff - clean_diff) / gap
 
             # Decide which (ranking, tau) buckets this step counts toward
@@ -306,9 +358,9 @@ def main():
                     g = cap_g[L].grad
                     if g is None:
                         raise RuntimeError(f"No grad at L={L} on {label}")
-                    inter_act_sp = cap_g[L][0, sp, :].detach().to(torch.float32).cpu()
-                    grad_sp      = g[0, sp, :].detach().to(torch.float32).cpu()
-                    clean_sp     = clean_at_sp[L].to(torch.float32)
+                    inter_act_sp = cap_g[L][0, use_sp, :].detach().to(torch.float32).cpu()
+                    grad_sp      = g[0, use_sp, :].detach().to(torch.float32).cpu()
+                    clean_sp     = use_clean_at_sp[L].to(torch.float32)
                     attr_vec = ((clean_sp - inter_act_sp) * grad_sp).sum(dim=0)
                     for (rk, tl) in buckets:
                         per_prompt[rk][tl][L] += attr_vec
@@ -340,9 +392,9 @@ def main():
                     for h in handles: h.remove()
                     for L in target_layers:
                         g2 = cap_g2[L].grad
-                        v  = cap_g2[L][0, sp, :].detach().to(torch.float32).cpu()
+                        v  = cap_g2[L][0, use_sp, :].detach().to(torch.float32).cpu()
                         # RelP: sum_p v * grad_lin(v) over suffix positions
-                        relp_vec = (v * g2[0, sp, :].detach().to(torch.float32).cpu()).sum(dim=0)
+                        relp_vec = (v * g2[0, use_sp, :].detach().to(torch.float32).cpu()).sum(dim=0)
                         for tl in relp_buckets:
                             per_prompt["relp"][tl][L] += relp_vec
                     for tl in relp_buckets:
