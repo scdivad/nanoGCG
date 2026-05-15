@@ -292,11 +292,29 @@ class GCG:
         embedding_layer = self.embedding_layer
         before_embeds, after_embeds, target_embeds = [embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)]
 
-        # Compute the KV Cache for tokens that appear before the optimized tokens
+        # Compute the KV Cache for tokens that appear before the optimized tokens.
+        # IMPORTANT (transformers>=4.40): the model mutates whatever Cache object
+        # it's handed during the forward pass — torch.cat'ing new KVs into the
+        # cache's internal lists. Reusing self.prefix_cache across iterations
+        # therefore pollutes it with previous-step optim/after/target KVs, which
+        # silently boosts P(target) on subsequent steps (because attention now
+        # has the target token sitting in its own past) and reports artificially
+        # low loss values that don't transfer to inference. Snapshot the legacy
+        # tuple form (which holds references to the original "before"-only K/V
+        # tensors) and rebuild a fresh DynamicCache from it on every model call.
         if config.use_prefix_cache:
             with torch.no_grad():
                 output = model(inputs_embeds=before_embeds, use_cache=True)
-                self.prefix_cache = output.past_key_values
+                cache = output.past_key_values
+                # Snapshot. to_legacy_cache() returns a tuple of (k, v) tuples
+                # referencing the current key_cache[i] / value_cache[i] tensors;
+                # those tensors stay alive as long as we hold the snapshot, and
+                # they won't be mutated since we never pass self.prefix_legacy
+                # directly to model().
+                self.prefix_legacy = cache.to_legacy_cache()
+                # Keep self.prefix_cache truthy for the `if self.prefix_cache:`
+                # gates throughout the codebase, but never pass it to model().
+                self.prefix_cache = cache
 
         self.target_ids = target_ids
         self.before_embeds = before_embeds
@@ -460,6 +478,29 @@ class GCG:
 
         return result
 
+    def _fresh_prefix_cache(self, expand_to: int = None):
+        """Rebuild a fresh DynamicCache from the stable prefix-tensor snapshot.
+
+        The model mutates whatever past_key_values it receives (appending new
+        KVs via torch.cat). To keep self.prefix_legacy clean across iterations,
+        every model() call that wants the prefix cached gets a fresh wrapper
+        whose internal key_cache/value_cache lists are NEW (so the model's
+        torch.cat-into-list-element mutates this throwaway wrapper, not the
+        snapshot tensors).
+
+        If expand_to is given, also expand each prefix tensor's batch dim to
+        match the candidate batch size (used in candidate-loss eval). Expanding
+        is a view, not a copy.
+        """
+        from transformers.cache_utils import DynamicCache
+        if expand_to is None or expand_to == 1:
+            return DynamicCache.from_legacy_cache(self.prefix_legacy)
+        legacy = tuple(
+            tuple(x.expand(expand_to, -1, -1, -1) for x in self.prefix_legacy[i])
+            for i in range(len(self.prefix_legacy))
+        )
+        return DynamicCache.from_legacy_cache(legacy)
+
     def init_buffer(self) -> AttackBuffer:
         model = self.model
         tokenizer = self.tokenizer
@@ -586,7 +627,7 @@ class GCG:
             input_embeds = torch.cat([optim_embeds, self.after_embeds, self.target_embeds], dim=1)
             output = model(
                 inputs_embeds=input_embeds,
-                past_key_values=self.prefix_cache,
+                past_key_values=self._fresh_prefix_cache(),
                 use_cache=True,
             )
         else:
@@ -692,7 +733,6 @@ class GCG:
                 the embeddings of the `search_width` candidate sequences to evaluate
         """
         all_loss = []
-        prefix_cache_batch = []
 
         for i in range(0, input_embeds.shape[0], search_batch_size):
             with torch.no_grad():
@@ -700,17 +740,13 @@ class GCG:
                 current_batch_size = input_embeds_batch.shape[0]
 
                 if self.prefix_cache:
-                    if not prefix_cache_batch or current_batch_size != search_batch_size:
-                        # Build expanded cache as legacy list-of-tuples, then
-                        # convert to DynamicCache for transformers>=4.40 which
-                        # rejects raw list/tuple past_key_values.
-                        legacy = tuple(
-                            tuple(x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i])
-                            for i in range(len(self.prefix_cache))
-                        )
-                        from transformers.cache_utils import DynamicCache
-                        prefix_cache_batch = DynamicCache.from_legacy_cache(legacy)
-
+                    # Fresh cache per inner batch: the model mutates the passed-in
+                    # DynamicCache by appending KVs during forward, so reusing
+                    # across inner batches would feed earlier candidates' target
+                    # tokens into the cache and silently boost P(target) on
+                    # later candidates. Build a throwaway fresh wrapper around
+                    # the immutable prefix-tensor snapshot every time.
+                    prefix_cache_batch = self._fresh_prefix_cache(expand_to=current_batch_size)
                     outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, use_cache=True)
                 else:
                     outputs = self.model(inputs_embeds=input_embeds_batch)
