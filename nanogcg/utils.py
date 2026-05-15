@@ -102,8 +102,13 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
     # Start from the persisted batch_size (capped by the requested starting size)
     # rather than always starting at `starting_batch_size`. This avoids re-doing
     # the OOM-halving every time the decorator is recreated.
-    key = id(function)
-    cached = _RESOLVED_BATCH_SIZES.get(key)
+    #
+    # Use the function itself as the dict key. For bound methods (e.g.
+    # `self._compute_candidates_loss_original`) Python creates a fresh bound-
+    # method object on every attribute access, so id() is unstable — but
+    # bound-method hashing is based on (self, __func__), so dict lookup with
+    # the bound method as key matches across accesses.
+    cached = _RESOLVED_BATCH_SIZES.get(function)
     batch_size = min(cached, starting_batch_size) if cached is not None else starting_batch_size
 
     def decorator(*args, **kwargs):
@@ -123,7 +128,7 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
                 raise RuntimeError("No executable batch size found, reached zero.")
             try:
                 result = function(batch_size, *args, **kwargs)
-                _RESOLVED_BATCH_SIZES[key] = batch_size
+                _RESOLVED_BATCH_SIZES[function] = batch_size
                 return result
             except Exception as e:
                 if should_reduce_batch_size(e):
