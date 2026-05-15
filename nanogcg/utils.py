@@ -53,6 +53,14 @@ def should_reduce_batch_size(exception: Exception) -> bool:
         return any(err in exception.args[0] for err in _statements)
     return False
 
+# Persistent cache of resolved batch sizes per (function, id) so that the
+# OOM-halving dance only happens once instead of every iteration when the
+# decorator is recreated on each call. Keyed by the wrapped function so that
+# different callsites (e.g. main-loop candidate-loss vs init-buffer loss) don't
+# share a single global value.
+_RESOLVED_BATCH_SIZES: dict = {}
+
+
 # modified from https://github.com/huggingface/accelerate/blob/85a75d4c3d0deffde2fc8b917d9b1ae1cb580eb2/src/accelerate/utils/memory.py#L87
 def find_executable_batch_size(function: callable = None, starting_batch_size: int = 128):
     """
@@ -61,11 +69,18 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
 
     `function` must take in a `batch_size` parameter as its first argument.
 
+    Persists the resolved batch_size across decorator-creations via a
+    module-level cache keyed by the wrapped function, so callers that
+    re-create the decorator on every loop iteration (as nanoGCG does)
+    don't pay the OOM-halving cost every step.
+
     Args:
         function (`callable`, *optional*):
             A function to wrap
         starting_batch_size (`int`, *optional*):
-            The batch size to try and fit into memory
+            The batch size to try and fit into memory. If a smaller value
+            has already been resolved for this function in a previous call,
+            we use that instead (capped by this starting_batch_size).
 
     Example:
 
@@ -84,7 +99,12 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
     if function is None:
         return functools.partial(find_executable_batch_size, starting_batch_size=starting_batch_size)
 
-    batch_size = starting_batch_size
+    # Start from the persisted batch_size (capped by the requested starting size)
+    # rather than always starting at `starting_batch_size`. This avoids re-doing
+    # the OOM-halving every time the decorator is recreated.
+    key = id(function)
+    cached = _RESOLVED_BATCH_SIZES.get(key)
+    batch_size = min(cached, starting_batch_size) if cached is not None else starting_batch_size
 
     def decorator(*args, **kwargs):
         nonlocal batch_size
@@ -102,7 +122,9 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
             if batch_size == 0:
                 raise RuntimeError("No executable batch size found, reached zero.")
             try:
-                return function(batch_size, *args, **kwargs)
+                result = function(batch_size, *args, **kwargs)
+                _RESOLVED_BATCH_SIZES[key] = batch_size
+                return result
             except Exception as e:
                 if should_reduce_batch_size(e):
                     gc.collect()
