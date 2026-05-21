@@ -515,12 +515,20 @@ class GCG:
         """
         from transformers.cache_utils import DynamicCache
         if expand_to is None or expand_to == 1:
-            return DynamicCache.from_legacy_cache(self.prefix_legacy)
-        legacy = tuple(
-            tuple(x.expand(expand_to, -1, -1, -1) for x in self.prefix_legacy[i])
-            for i in range(len(self.prefix_legacy))
-        )
-        return DynamicCache.from_legacy_cache(legacy)
+            layer_kvs = self.prefix_legacy
+        else:
+            layer_kvs = tuple(
+                (k.expand(expand_to, -1, -1, -1), v.expand(expand_to, -1, -1, -1))
+                for (k, v) in self.prefix_legacy
+            )
+        # transformers compat: from_legacy_cache() classmethod was removed in
+        # 4.55+. Fall back to incremental update() which is portable.
+        if hasattr(DynamicCache, "from_legacy_cache"):
+            return DynamicCache.from_legacy_cache(layer_kvs)
+        cache = DynamicCache()
+        for i, (k, v) in enumerate(layer_kvs):
+            cache.update(k, v, layer_idx=i)
+        return cache
 
     def init_buffer(self) -> AttackBuffer:
         model = self.model
@@ -849,7 +857,12 @@ class GCG:
                                 for i in range(len(self.draft_prefix_cache))
                             )
                             from transformers.cache_utils import DynamicCache
-                            draft_prefix_cache_batch = DynamicCache.from_legacy_cache(legacy)
+                            if hasattr(DynamicCache, "from_legacy_cache"):
+                                draft_prefix_cache_batch = DynamicCache.from_legacy_cache(legacy)
+                            else:
+                                draft_prefix_cache_batch = DynamicCache()
+                                for _li, (_k, _v) in enumerate(legacy):
+                                    draft_prefix_cache_batch.update(_k, _v, layer_idx=_li)
                         draft_embeds = torch.cat(
                             [
                                 self.draft_embedding_layer(draft_sampled_ids_batch),
