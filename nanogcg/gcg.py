@@ -311,7 +311,17 @@ class GCG:
                 # those tensors stay alive as long as we hold the snapshot, and
                 # they won't be mutated since we never pass self.prefix_legacy
                 # directly to model().
-                self.prefix_legacy = cache.to_legacy_cache()
+                #
+                # transformers compat: to_legacy_cache() was removed in 4.50+.
+                # On newer versions, build the legacy-tuple form manually from
+                # the DynamicCache's internal key_cache/value_cache lists.
+                if hasattr(cache, "to_legacy_cache"):
+                    self.prefix_legacy = cache.to_legacy_cache()
+                else:
+                    self.prefix_legacy = tuple(
+                        (cache.key_cache[i], cache.value_cache[i])
+                        for i in range(len(cache.key_cache))
+                    )
                 # Keep self.prefix_cache truthy for the `if self.prefix_cache:`
                 # gates throughout the codebase, but never pass it to model().
                 self.prefix_cache = cache
