@@ -312,16 +312,27 @@ class GCG:
                 # they won't be mutated since we never pass self.prefix_legacy
                 # directly to model().
                 #
-                # transformers compat: to_legacy_cache() was removed in 4.50+.
-                # On newer versions, build the legacy-tuple form manually from
-                # the DynamicCache's internal key_cache/value_cache lists.
+                # transformers compat: the DynamicCache API has shifted across
+                # versions (key_cache/value_cache lists → layers → ...). Use
+                # iteration since DynamicCache.__iter__ yields (k, v) tuples
+                # per layer in every version we've seen.
                 if hasattr(cache, "to_legacy_cache"):
                     self.prefix_legacy = cache.to_legacy_cache()
-                else:
+                elif hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+                    # transformers ~4.40–4.49
                     self.prefix_legacy = tuple(
                         (cache.key_cache[i], cache.value_cache[i])
                         for i in range(len(cache.key_cache))
                     )
+                elif hasattr(cache, "layers"):
+                    # transformers 4.55+: cache.layers[i].keys / .values
+                    self.prefix_legacy = tuple(
+                        (layer.keys, layer.values) for layer in cache.layers
+                    )
+                else:
+                    # Last resort: iterate. DynamicCache.__iter__ yields
+                    # (key, value) tuples per layer.
+                    self.prefix_legacy = tuple((k, v) for k, v in cache)
                 # Keep self.prefix_cache truthy for the `if self.prefix_cache:`
                 # gates throughout the codebase, but never pass it to model().
                 self.prefix_cache = cache
