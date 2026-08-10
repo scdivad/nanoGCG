@@ -738,6 +738,20 @@ class GCG:
         buffer = self.init_buffer()
         optim_ids = buffer.get_best_ids()
 
+        # init_buffer evaluates the initial buffer (for buffer_size 0/1, a SINGLE
+        # candidate at batch 1). find_executable_batch_size caches that resolved
+        # batch size keyed by the candidate-loss method, and the main loop then
+        # takes min(cached, search_width) — so a cached "1" from init pins every
+        # subsequent candidate eval to batch 1: ONE forward per candidate instead
+        # of one batched forward over all candidates (a ~search_width-fold
+        # slowdown — the dominant cost of universal GCG). Clear the cache so the
+        # main loop re-resolves at the real (large) search width.
+        try:
+            from nanogcg.utils import _RESOLVED_BATCH_SIZES
+            _RESOLVED_BATCH_SIZES.clear()
+        except Exception:
+            pass
+
         losses = []
         optim_strings = []
         optim_ids_history = []   # best optim_ids per step, index-aligned with `losses`
