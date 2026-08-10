@@ -29,8 +29,31 @@ def get_nonascii_toks(tokenizer, device="cpu"):
         nonascii_toks.append(tokenizer.pad_token_id)
     if tokenizer.unk_token_id is not None:
         nonascii_toks.append(tokenizer.unk_token_id)
-    
+
     return torch.tensor(nonascii_toks, device=device)
+
+
+def get_special_toks(tokenizer, device="cpu"):
+    """All special / added-vocab token ids (bos/eos/pad/unk plus every entry in
+    added_tokens_decoder, e.g. Llama-3's <|...|> control + reserved tokens).
+
+    These must never appear in an optimized GCG string: they decode to ASCII
+    strings (so get_nonascii_toks does NOT catch them), but the model treats
+    them as single control tokens, and as literal text in a suffix they
+    re-tokenize inconsistently at the prompt boundary — producing a fake
+    low loss that doesn't transfer to inference.
+    """
+    ids = set()
+    for attr in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id"):
+        v = getattr(tokenizer, attr, None)
+        if v is not None:
+            ids.add(int(v))
+    for v in (getattr(tokenizer, "all_special_ids", None) or []):
+        ids.add(int(v))
+    # added_tokens_decoder: {id: AddedToken} — covers all reserved/control toks.
+    for k in (getattr(tokenizer, "added_tokens_decoder", None) or {}):
+        ids.add(int(k))
+    return torch.tensor(sorted(ids), device=device, dtype=torch.int64)
 
 def mellowmax(t: Tensor, alpha=1.0, dim=-1):
    return 1.0 / alpha * (torch.logsumexp(alpha * t, dim=dim) - torch.log(torch.tensor(t.shape[-1], dtype=t.dtype, device=t.device)))
