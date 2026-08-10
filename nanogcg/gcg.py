@@ -64,6 +64,27 @@ class ProbeSamplingConfig:
 class GCGConfig:
     num_steps: int = 250
     optim_str_init: Union[str, List[str]] = "x x x x x x x x x x x x x x x x x x x x"
+    # MULTI-REGION (N independent suffixes) GCG. When the prompt template
+    # contains the ordered placeholders `{optim_0}`, `{optim_1}`, ... `{optim_{K-1}}`
+    # (instead of the usual single `{optim_str}`), K independent adversarial
+    # strings are optimized JOINTLY: `optim_str_inits[i]` initializes region i.
+    # They are concatenated into one optimization vector and updated together;
+    # only buffer_size in {0, 1} is supported in this mode. Leave None for the
+    # ordinary single-region behavior (`{optim_str}` / append-at-end).
+    optim_str_inits: Optional[List[str]] = None
+    # Extra kwargs forwarded to tokenizer.apply_chat_template (e.g.
+    # {"enable_thinking": False} for Qwen3, which must match the inference-time
+    # rendering or the optimized suffix won't transfer). None => no extra kwargs.
+    chat_template_kwargs: Optional[dict] = None
+    # Compute logits only at the target span (via logits_to_keep = n_target + 1)
+    # instead of over the whole sequence. The target sits at the END of the input,
+    # so only the last n_target+1 positions' logits are needed for the CE — this
+    # skips the lm_head projection over the (huge) vocab at every other position,
+    # a ~100x reduction in the dominant cost for long prompts / big vocabularies.
+    # Numerically identical to the full-logits path (same logits at those
+    # positions); verified against a full-sequence forward. Applies to the
+    # serial (per-bundle) gradient and candidate-loss paths.
+    target_logits_only: bool = True
     search_width: int = 512
     batch_size: int = None
     topk: int = 256
@@ -102,6 +123,13 @@ class GCGResult:
     best_string: str
     losses: List[float]
     strings: List[str]
+    # Multi-region runs only: the raw token ids of the best step (all regions
+    # concatenated in order) and each region's token length. best_string is the
+    # decoded concatenation (not directly usable as a prompt); callers should
+    # split best_ids by cumulative sums of optim_region_lens to recover the K
+    # suffixes. None for single-region runs.
+    best_ids: Optional[Tensor] = None
+    optim_region_lens: Optional[List[int]] = None
 
 
 @dataclass
@@ -124,6 +152,16 @@ class PromptBundle:
     target_embeds: Tensor       # (1, n_target, d)
     prefix_cache: object = None       # DynamicCache (kept truthy for gates)
     prefix_legacy: object = None      # tuple[(k, v), …] snapshot for _fresh_prefix_cache
+    # after_str/after_ids are stashed for boundary filtering. Populated for all
+    # bundles; used by the multi-region filter (and harmless otherwise).
+    after_str: str = None
+    after_ids: Tensor = None
+    # MULTI-REGION only: the K-1 fixed text segments sitting BETWEEN consecutive
+    # optimized regions (mids[i] is between region i and region i+1). None for
+    # single-region.
+    region_mids_str: list = None      # List[str],   len K-1
+    region_mids_ids: list = None      # List[Tensor], len K-1
+    region_mids_embeds: list = None   # List[Tensor (1, n_mid_i, d)], len K-1
 
 
 class AttackBuffer:
@@ -308,6 +346,85 @@ def filter_ids(
     return torch.stack(filtered_ids)
 
 
+def filter_ids_multi_region(
+    ids: Tensor,
+    tokenizer: transformers.PreTrainedTokenizer,
+    region_ctx: List[Tuple[str, list, list, str, list]],
+    region_lens: List[int],
+    raise_on_empty: bool = True,
+):
+    """Boundary filter for MULTI-REGION (K independent suffixes) GCG.
+
+    Each candidate row is `region_0 ++ region_1 ++ ... ++ region_{K-1}`, with
+    `region_lens[i]` tokens in region i. At inference the suffixes are spliced
+    into the prompt as TEXT:
+        before + d(r0) + mid_0 + d(r1) + mid_1 + ... + d(r_{K-1}) + after
+    A candidate survives iff EVERY optimized region's tokens are preserved in
+    their actual left-context — i.e. for each region i, re-tokenizing the text
+    up to and including region i extends the region's left-context tokenization
+    by EXACTLY region i's ids (no bleed at region i's left boundary, and its
+    tokens are not disturbed by the fixed text that precedes it). This is the
+    per-region generalization of the single-region `filter_ids` boundary check
+    and prevents token-space wins that don't transfer to the real prompt.
+
+    `region_ctx` is one tuple per bundle: (before_str, before_ids_list,
+    mids_str_list [len K-1], after_str, after_ids_list). A candidate must survive
+    against EVERY bundle (intersection), since the fixed text (and thus the bleed
+    pattern) differs per prompt.
+    """
+    K = len(region_lens)
+    # cumulative region start offsets within a candidate row
+    starts = [0]
+    for L in region_lens:
+        starts.append(starts[-1] + L)
+
+    surviving = ids
+    for (before_str, before_list, mids_str, after_str, after_list) in region_ctx:
+        if surviving.shape[0] == 0:
+            break
+        S = surviving.shape[0]
+        # decode each region for every surviving candidate
+        dec = [tokenizer.batch_decode(surviving[:, starts[i]:starts[i + 1]]) for i in range(K)]
+        # left_context[c] accumulates before + d(r0) + mid_0 + ... as we walk regions
+        left_context = [before_str] * S
+        ok = [True] * S
+        nb = len(before_list)
+        for i in range(K):
+            # tokenize left-context and left-context+region_i in two batch calls
+            base = tokenizer([left_context[c] for c in range(S)], padding=False, add_special_tokens=True)["input_ids"]
+            ext = tokenizer([left_context[c] + dec[i][c] for c in range(S)], padding=False, add_special_tokens=True)["input_ids"]
+            for c in range(S):
+                if not ok[c]:
+                    continue
+                reg_ids = surviving[c, starts[i]:starts[i + 1]].tolist()
+                # region i's tokens must be exactly appended to its left-context tokenization
+                if not (ext[c][:len(base[c])] == base[c] and ext[c][len(base[c]):] == reg_ids):
+                    ok[c] = False
+                    continue
+                # region 0 must also start exactly after `before` (left anchor)
+                if i == 0 and base[c][:nb] != before_list:
+                    ok[c] = False
+            # advance left-context by this region's text + the following mid (if any)
+            for c in range(S):
+                left_context[c] = left_context[c] + dec[i][c] + (mids_str[i] if i < K - 1 else "")
+        # final: full string's tail must equal after (right anchor)
+        if after_list:
+            na = len(after_list)
+            full = tokenizer([left_context[c] + after_str for c in range(S)], padding=False, add_special_tokens=True)["input_ids"]
+            for c in range(S):
+                if ok[c] and full[c][len(full[c]) - na:] != after_list:
+                    ok[c] = False
+        keep = [surviving[c] for c in range(S) if ok[c]]
+        surviving = torch.stack(keep) if keep else ids.new_empty((0, surviving.shape[1]))
+
+    if surviving.shape[0] == 0 and raise_on_empty:
+        raise RuntimeError(
+            "No token sequences survived the multi-region boundary filter. "
+            "Consider setting `filter_ids=False` or different inits."
+        )
+    return surviving
+
+
 class GCG:
     def __init__(
         self,
@@ -331,6 +448,11 @@ class GCG:
             self.not_allowed_ids = torch.unique(torch.cat([nonascii, special_ids]))
         self.prefix_cache = None
         self.draft_prefix_cache = None
+
+        # Multi-region (K-suffix) state. optim_region_lens is the per-region
+        # token length list; when not None the run is in multi-region mode.
+        self.optim_region_lens = None
+        self._region_ctx = None
 
         self.stop_flag = False
 
@@ -408,17 +530,47 @@ class GCG:
         else:
             messages = copy.deepcopy(messages)
 
-        # Append the GCG string at the end of the prompt if location not specified
-        if not any(["{optim_str}" in d["content"] for d in messages]):
-            messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
+        # Multi-region mode: template carries ordered `{optim_0}`..`{optim_{K-1}}`.
+        joined = "".join(d["content"] for d in messages)
+        n_regions = 0
+        while f"{{optim_{n_regions}}}" in joined:
+            n_regions += 1
+        multi_region = n_regions > 0
 
-        template = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        if not multi_region:
+            # Append the GCG string at the end of the prompt if location not specified
+            if not any(["{optim_str}" in d["content"] for d in messages]):
+                messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
+
+        ct_kwargs = config.chat_template_kwargs or {}
+        template = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **ct_kwargs)
         # Remove the BOS token -- this will get added when tokenizing, if necessary
         if tokenizer.bos_token and template.startswith(tokenizer.bos_token):
             template = template.replace(tokenizer.bos_token, "")
-        before_str, after_str = template.split("{optim_str}")
 
         target = " " + target if config.add_space_before_target else target
+        embedding_layer = self.embedding_layer
+
+        region_mids_str = region_mids_ids = region_mids_embeds = None
+        if multi_region:
+            if config.optim_str_inits is None or len(config.optim_str_inits) != n_regions:
+                raise ValueError(
+                    f"multi-region GCG found {n_regions} `{{optim_i}}` placeholders but "
+                    f"config.optim_str_inits has {None if config.optim_str_inits is None else len(config.optim_str_inits)} entries"
+                )
+            # Split the template on the ordered placeholders into
+            # [before, mid_0, mid_1, ..., mid_{K-2}, after].
+            before_str, rest = template.split("{optim_0}")
+            region_mids_str = []
+            for i in range(1, n_regions):
+                seg, rest = rest.split(f"{{optim_{i}}}")
+                region_mids_str.append(seg)   # text between region i-1 and region i
+            after_str = rest
+            region_mids_ids = [tokenizer([s], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
+                               for s in region_mids_str]
+            region_mids_embeds = [embedding_layer(x) for x in region_mids_ids]
+        else:
+            before_str, after_str = template.split("{optim_str}")
 
         # Tokenize everything that doesn't get optimized
         before_ids = tokenizer([before_str], padding=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
@@ -426,7 +578,6 @@ class GCG:
         target_ids = tokenizer([target], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
 
         # Embed everything that doesn't get optimized
-        embedding_layer = self.embedding_layer
         before_embeds, after_embeds, target_embeds = [embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)]
 
         prefix_cache = None
@@ -478,6 +629,11 @@ class GCG:
             target_embeds=target_embeds,
             prefix_cache=prefix_cache,
             prefix_legacy=prefix_legacy,
+            after_str=after_str,
+            after_ids=after_ids,
+            region_mids_str=region_mids_str,
+            region_mids_ids=region_mids_ids,
+            region_mids_embeds=region_mids_embeds,
         )
 
     def _run_bundles(self, bundles: List[PromptBundle]) -> GCGResult:
@@ -513,6 +669,26 @@ class GCG:
             self._filter_before_str = primary.before_str
             self._filter_before_ids = primary.before_ids[0]
 
+        # Multi-region (K-suffix) setup. optim_region_lens = per-region token
+        # lengths (from the inits). Build the per-bundle boundary context used by
+        # the multi-region filter. The cross-bundle fast path is NOT compatible
+        # with multi-region (there is fixed text between the adv slots), so it is
+        # disabled below.
+        if primary.region_mids_embeds is not None:
+            self.optim_region_lens = [
+                tokenizer([s], add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
+                for s in config.optim_str_inits
+            ]
+            # filter needs, per bundle: before, before_ids, the K-1 mid strings, after, after_ids
+            self._region_ctx = [
+                (b.before_str, b.before_ids[0].tolist(), list(b.region_mids_str),
+                 b.after_str, b.after_ids[0].tolist())
+                for b in bundles
+            ]
+        else:
+            self.optim_region_lens = None
+            self._region_ctx = None
+
         # Universal fast path: cross-bundle batching. Available only when every
         # bundle shares the same before_ids (typical for adv-prefix placement
         # with a single system prompt). One forward per chunk covers all
@@ -520,7 +696,7 @@ class GCG:
         # N × chunks_per_bundle to just chunks_per_bundle. See
         # `_setup_universal_shared_prefix` for what gets precomputed.
         self._univ_shared = False
-        if len(bundles) > 1 and config.use_prefix_cache:
+        if len(bundles) > 1 and config.use_prefix_cache and self.optim_region_lens is None:
             self._setup_universal_shared_prefix()
 
         # Initialize components for probe sampling, if enabled (single-prompt only).
@@ -532,7 +708,8 @@ class GCG:
             # its template. (We don't stash after_str on the bundle since only
             # probe sampling needs it, and it's easy to recompute here.)
             _tmpl_msgs = copy.deepcopy(primary.messages)
-            _tmpl = tokenizer.apply_chat_template(_tmpl_msgs, tokenize=False, add_generation_prompt=True)
+            _tmpl = tokenizer.apply_chat_template(_tmpl_msgs, tokenize=False, add_generation_prompt=True,
+                                                  **(config.chat_template_kwargs or {}))
             if tokenizer.bos_token and _tmpl.startswith(tokenizer.bos_token):
                 _tmpl = _tmpl.replace(tokenizer.bos_token, "")
             _, _after_str = _tmpl.split("{optim_str}")
@@ -563,6 +740,7 @@ class GCG:
 
         losses = []
         optim_strings = []
+        optim_ids_history = []   # best optim_ids per step, index-aligned with `losses`
 
         for step in tqdm(range(config.num_steps)):
             # Compute the token gradient (averaged across bundles)
@@ -587,7 +765,12 @@ class GCG:
                         not_allowed_ids=self.not_allowed_ids,
                     )
                     if config.filter_ids:
-                        if self._filter_boundary_ctx is not None:
+                        if self.optim_region_lens is not None:
+                            candidates = filter_ids_multi_region(
+                                candidates, tokenizer, self._region_ctx,
+                                self.optim_region_lens, raise_on_empty=False,
+                            )
+                        elif self._filter_boundary_ctx is not None:
                             candidates = filter_ids(
                                 candidates, tokenizer, raise_on_empty=False,
                                 boundary_ctx=self._filter_boundary_ctx,
@@ -609,6 +792,7 @@ class GCG:
                     losses.append(buffer.get_lowest_loss())
                     optim_str = tokenizer.batch_decode(buffer.get_best_ids())[0]
                     optim_strings.append(optim_str)
+                    optim_ids_history.append(buffer.get_best_ids().clone())
                     continue
 
                 new_search_width = sampled_ids.shape[0]
@@ -656,6 +840,7 @@ class GCG:
             optim_ids = buffer.get_best_ids()
             optim_str = tokenizer.batch_decode(optim_ids)[0]
             optim_strings.append(optim_str)
+            optim_ids_history.append(optim_ids.clone())
 
             buffer.log_buffer(tokenizer)
 
@@ -684,6 +869,8 @@ class GCG:
             best_string=optim_strings[min_loss_index],
             losses=losses,
             strings=optim_strings,
+            best_ids=(optim_ids_history[min_loss_index] if optim_ids_history else None),
+            optim_region_lens=self.optim_region_lens,
         )
 
         return result
@@ -808,7 +995,16 @@ class GCG:
         # Create the attack buffer and initialize the buffer ids
         buffer = AttackBuffer(config.buffer_size)
 
-        if isinstance(config.optim_str_init, str):
+        if self.optim_region_lens is not None:
+            # Multi-region: concatenate all region inits into one vector. Only a
+            # single buffer entry is supported (buffer_size in {0, 1}).
+            if config.buffer_size > 1:
+                raise NotImplementedError("multi-region GCG supports only buffer_size in {0, 1}")
+            region_ids = [tokenizer(s, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device)
+                          for s in config.optim_str_inits]
+            assert [x.shape[1] for x in region_ids] == self.optim_region_lens, "region init length mismatch"
+            init_buffer_ids = torch.cat(region_ids, dim=1)
+        elif isinstance(config.optim_str_init, str):
             init_optim_ids = tokenizer(config.optim_str_init, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device)
             if config.buffer_size > 1:
                 init_buffer_chars = tokenizer(INIT_CHARS, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze().to(model.device)
@@ -889,6 +1085,26 @@ class GCG:
 
         return buffer
 
+    def _optim_segments(self, optim_embeds_full: Tensor, bundle: PromptBundle) -> List[Tensor]:
+        """Split the (batched) optim embeddings into the segments to splice into
+        the prompt. Single-region: `[optim]`. Multi-region: interleave the K
+        region slices with the K-1 fixed per-bundle mid segments (broadcast to
+        the batch dim): `[r0, mid0, r1, mid1, ..., r_{K-1}]`. optim_embeds_full
+        has shape [B, n_total, d].
+        """
+        if self.optim_region_lens is None:
+            return [optim_embeds_full]
+        B = optim_embeds_full.shape[0]
+        segs = []
+        idx = 0
+        K = len(self.optim_region_lens)
+        for i, L in enumerate(self.optim_region_lens):
+            segs.append(optim_embeds_full[:, idx: idx + L, :])
+            idx += L
+            if i < K - 1:
+                segs.append(bundle.region_mids_embeds[i].expand(B, -1, -1))
+        return segs
+
     def compute_token_gradient(
         self,
         optim_ids: Tensor,
@@ -967,27 +1183,37 @@ class GCG:
 
         # Slow path (per-bundle loop).
         bundles = self.bundles
+        n_keep = None  # logits_to_keep: target is at the END, need n_target+1 positions
         loss_accum = None
         for b in bundles:
+            optim_seg = self._optim_segments(optim_embeds, b)   # [optim] or [optim_q, mid, optim_opt]
+            nt = b.target_ids.shape[1]
+            keep_kw = {"logits_to_keep": nt + 1} if self.config.target_logits_only else {}
             if b.prefix_cache:
-                input_embeds = torch.cat([optim_embeds, b.after_embeds, b.target_embeds], dim=1)
+                input_embeds = torch.cat([*optim_seg, b.after_embeds, b.target_embeds], dim=1)
                 output = model(
                     inputs_embeds=input_embeds,
                     past_key_values=self._fresh_prefix_cache(bundle=b),
                     use_cache=True,
+                    **keep_kw,
                 )
             else:
                 input_embeds = torch.cat(
-                    [b.before_embeds, optim_embeds, b.after_embeds, b.target_embeds],
+                    [b.before_embeds, *optim_seg, b.after_embeds, b.target_embeds],
                     dim=1,
                 )
-                output = model(inputs_embeds=input_embeds)
+                output = model(inputs_embeds=input_embeds, **keep_kw)
 
             logits = output.logits
 
-            # Shift logits so token n-1 predicts token n
-            shift = input_embeds.shape[1] - b.target_ids.shape[1]
-            shift_logits = logits[..., shift - 1 : -1, :].contiguous()
+            # Shift logits so token n-1 predicts token n. With target_logits_only,
+            # logits already cover only the last nt+1 positions -> the first nt of
+            # them predict the nt target tokens.
+            if self.config.target_logits_only:
+                shift_logits = logits[:, :-1, :].contiguous()
+            else:
+                shift = input_embeds.shape[1] - nt
+                shift_logits = logits[..., shift - 1 : -1, :].contiguous()
             shift_labels = b.target_ids
 
             if self.config.use_mellowmax:
@@ -1076,18 +1302,20 @@ class GCG:
 
         S = sampled_ids.shape[0]
         embedding_layer = self.embedding_layer
+        optim_embeds = embedding_layer(sampled_ids)   # [S, n_total, d]
         total = None
         for b in self.bundles:
+            optim_seg = self._optim_segments(optim_embeds, b)   # [optim] or [optim_q, mid, optim_opt]
             if b.prefix_cache:
                 input_embeds = torch.cat([
-                    embedding_layer(sampled_ids),
+                    *optim_seg,
                     b.after_embeds.repeat(S, 1, 1),
                     b.target_embeds.repeat(S, 1, 1),
                 ], dim=1)
             else:
                 input_embeds = torch.cat([
                     b.before_embeds.repeat(S, 1, 1),
-                    embedding_layer(sampled_ids),
+                    *optim_seg,
                     b.after_embeds.repeat(S, 1, 1),
                     b.target_embeds.repeat(S, 1, 1),
                 ], dim=1)
@@ -1234,6 +1462,11 @@ class GCG:
         """
         target_ids = bundle.target_ids if bundle is not None else self.target_ids
         has_prefix_cache = (bundle.prefix_cache if bundle is not None else self.prefix_cache)
+        nt = target_ids.shape[1]
+        # logits_to_keep: target is at the END, so only the last nt+1 positions'
+        # logits are needed. Skips the lm_head over the vocab at every other
+        # position (~100x on the dominant cost). Numerically identical.
+        keep_kw = {"logits_to_keep": nt + 1} if self.config.target_logits_only else {}
 
         all_loss = []
 
@@ -1250,14 +1483,18 @@ class GCG:
                     # later candidates. Build a throwaway fresh wrapper around
                     # the immutable prefix-tensor snapshot every time.
                     prefix_cache_batch = self._fresh_prefix_cache(expand_to=current_batch_size, bundle=bundle)
-                    outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, use_cache=True)
+                    outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, use_cache=True, **keep_kw)
                 else:
-                    outputs = self.model(inputs_embeds=input_embeds_batch)
+                    outputs = self.model(inputs_embeds=input_embeds_batch, **keep_kw)
 
                 logits = outputs.logits
 
-                tmp = input_embeds.shape[1] - target_ids.shape[1]
-                shift_logits = logits[..., tmp-1:-1, :].contiguous()
+                if self.config.target_logits_only:
+                    # logits already cover only the last nt+1 positions
+                    shift_logits = logits[:, :-1, :].contiguous()
+                else:
+                    tmp = input_embeds.shape[1] - nt
+                    shift_logits = logits[..., tmp-1:-1, :].contiguous()
                 shift_labels = target_ids.repeat(current_batch_size, 1)
 
                 if self.config.use_mellowmax:
