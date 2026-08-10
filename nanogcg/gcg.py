@@ -1181,10 +1181,19 @@ class GCG:
             optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
             return optim_ids_onehot_grad
 
-        # Slow path (per-bundle loop).
+        # Slow path (per-bundle loop). Accumulate the gradient bundle-by-bundle
+        # with a SEPARATE backward per bundle, freeing each bundle's autograd
+        # graph immediately. To avoid freeing the SHARED `optim_embeds = onehot @ W`
+        # node (which every bundle's forward reads), each backward targets
+        # `optim_embeds` (not the one-hot): this traverses/free only that bundle's
+        # forward and leaves the shared matmul intact. Since the embedding map is
+        # linear, d loss/d onehot = (d loss/d optim_embeds) @ W^T exactly, done
+        # once at the end. Result is identical to one backward over the mean loss,
+        # but peak memory is ONE bundle's activations instead of N — the
+        # single-backward version holds N x activations and crawls under memory
+        # pressure (the dominant cost of universal GCG); this keeps it flat.
         bundles = self.bundles
-        n_keep = None  # logits_to_keep: target is at the END, need n_target+1 positions
-        loss_accum = None
+        grad_embeds_accum = None
         for b in bundles:
             optim_seg = self._optim_segments(optim_embeds, b)   # [optim] or [optim_q, mid, optim_opt]
             nt = b.target_ids.shape[1]
@@ -1222,10 +1231,16 @@ class GCG:
             else:
                 loss_b = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-            loss_accum = loss_b if loss_accum is None else loss_accum + loss_b
+            # backward for THIS bundle only, to the shared optim_embeds (not the
+            # one-hot), then release this bundle's forward graph.
+            ge = torch.autograd.grad(outputs=[loss_b], inputs=[optim_embeds], retain_graph=False)[0]
+            grad_embeds_accum = ge if grad_embeds_accum is None else grad_embeds_accum + ge
+            del output, logits, shift_logits, loss_b, ge
 
-        loss = loss_accum / len(bundles)
-        optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
+        # map accumulated grad wrt embeds back to the one-hot analytically:
+        # optim_embeds = onehot @ W  =>  d loss/d onehot = (d loss/d optim_embeds) @ W^T.
+        grad_embeds_accum = grad_embeds_accum / len(bundles)
+        optim_ids_onehot_grad = grad_embeds_accum.to(embedding_layer.weight.dtype) @ embedding_layer.weight.t()
 
         return optim_ids_onehot_grad
 
