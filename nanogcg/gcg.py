@@ -156,12 +156,14 @@ class PromptBundle:
     # bundles; used by the multi-region filter (and harmless otherwise).
     after_str: str = None
     after_ids: Tensor = None
-    # MULTI-REGION only: the K-1 fixed text segments sitting BETWEEN consecutive
-    # optimized regions (mids[i] is between region i and region i+1). None for
-    # single-region.
-    region_mids_str: list = None      # List[str],   len K-1
-    region_mids_ids: list = None      # List[Tensor], len K-1
-    region_mids_embeds: list = None   # List[Tensor (1, n_mid_i, d)], len K-1
+    # MULTI-REGION only. slot_regions[j] = which optimized region fills slot j
+    # (slots ordered by appearance; a region index may repeat => tied suffix).
+    # slot_mids_* are the fixed text segments BETWEEN consecutive slots
+    # (len = n_slots - 1). None for single-region.
+    slot_regions: list = None         # List[int],  len n_slots
+    slot_mids_str: list = None        # List[str],  len n_slots-1
+    slot_mids_ids: list = None        # List[Tensor], len n_slots-1
+    slot_mids_embeds: list = None     # List[Tensor (1, n_mid_j, d)], len n_slots-1
 
 
 class AttackBuffer:
@@ -351,70 +353,66 @@ def filter_ids_multi_region(
     tokenizer: transformers.PreTrainedTokenizer,
     region_ctx: List[Tuple[str, list, list, str, list]],
     region_lens: List[int],
+    slot_regions: List[int],
     raise_on_empty: bool = True,
 ):
-    """Boundary filter for MULTI-REGION (K independent suffixes) GCG.
+    """Boundary filter for MULTI-REGION GCG (K distinct suffixes, placed at S
+    slots; a region may fill multiple slots => TIED suffix).
 
-    Each candidate row is `region_0 ++ region_1 ++ ... ++ region_{K-1}`, with
-    `region_lens[i]` tokens in region i. At inference the suffixes are spliced
-    into the prompt as TEXT:
-        before + d(r0) + mid_0 + d(r1) + mid_1 + ... + d(r_{K-1}) + after
-    A candidate survives iff EVERY optimized region's tokens are preserved in
-    their actual left-context — i.e. for each region i, re-tokenizing the text
-    up to and including region i extends the region's left-context tokenization
-    by EXACTLY region i's ids (no bleed at region i's left boundary, and its
-    tokens are not disturbed by the fixed text that precedes it). This is the
-    per-region generalization of the single-region `filter_ids` boundary check
-    and prevents token-space wins that don't transfer to the real prompt.
+    Each candidate row is `region_0 ++ ... ++ region_{K-1}` (region_lens[k]
+    tokens each). At inference the suffixes are spliced into the prompt as TEXT
+    in SLOT order:
+        before + d(reg[slot_0]) + mid_0 + d(reg[slot_1]) + mid_1 + ... + after
+    A candidate survives iff EVERY slot's optimized tokens are preserved in their
+    actual left-context — i.e. for each slot, re-tokenizing the text up to and
+    including that slot extends the left-context tokenization by EXACTLY that
+    region's ids (no bleed at the slot's left boundary). A tied region is checked
+    at each slot it fills, so it must round-trip in BOTH contexts. This prevents
+    token-space wins that don't transfer to the real prompt.
 
     `region_ctx` is one tuple per bundle: (before_str, before_ids_list,
-    mids_str_list [len K-1], after_str, after_ids_list). A candidate must survive
-    against EVERY bundle (intersection), since the fixed text (and thus the bleed
-    pattern) differs per prompt.
+    slot_mids_str_list [len S-1], after_str, after_ids_list). `slot_regions[j]`
+    is the region index at slot j. A candidate must survive EVERY bundle.
     """
-    K = len(region_lens)
-    # cumulative region start offsets within a candidate row
+    # start offset of each distinct region within a candidate row
     starts = [0]
     for L in region_lens:
         starts.append(starts[-1] + L)
+    S = len(slot_regions)
 
     surviving = ids
     for (before_str, before_list, mids_str, after_str, after_list) in region_ctx:
         if surviving.shape[0] == 0:
             break
-        S = surviving.shape[0]
-        # decode each region for every surviving candidate
-        dec = [tokenizer.batch_decode(surviving[:, starts[i]:starts[i + 1]]) for i in range(K)]
-        # left_context[c] accumulates before + d(r0) + mid_0 + ... as we walk regions
-        left_context = [before_str] * S
-        ok = [True] * S
+        n = surviving.shape[0]
+        # decode each distinct region once per candidate
+        dec = {r: tokenizer.batch_decode(surviving[:, starts[r]:starts[r + 1]])
+               for r in set(slot_regions)}
+        left_context = [before_str] * n
+        ok = [True] * n
         nb = len(before_list)
-        for i in range(K):
-            # tokenize left-context and left-context+region_i in two batch calls
-            base = tokenizer([left_context[c] for c in range(S)], padding=False, add_special_tokens=True)["input_ids"]
-            ext = tokenizer([left_context[c] + dec[i][c] for c in range(S)], padding=False, add_special_tokens=True)["input_ids"]
-            for c in range(S):
+        for j in range(S):
+            r = slot_regions[j]
+            base = tokenizer([left_context[c] for c in range(n)], padding=False, add_special_tokens=True)["input_ids"]
+            ext = tokenizer([left_context[c] + dec[r][c] for c in range(n)], padding=False, add_special_tokens=True)["input_ids"]
+            for c in range(n):
                 if not ok[c]:
                     continue
-                reg_ids = surviving[c, starts[i]:starts[i + 1]].tolist()
-                # region i's tokens must be exactly appended to its left-context tokenization
+                reg_ids = surviving[c, starts[r]:starts[r + 1]].tolist()
                 if not (ext[c][:len(base[c])] == base[c] and ext[c][len(base[c]):] == reg_ids):
                     ok[c] = False
                     continue
-                # region 0 must also start exactly after `before` (left anchor)
-                if i == 0 and base[c][:nb] != before_list:
+                if j == 0 and base[c][:nb] != before_list:   # left anchor
                     ok[c] = False
-            # advance left-context by this region's text + the following mid (if any)
-            for c in range(S):
-                left_context[c] = left_context[c] + dec[i][c] + (mids_str[i] if i < K - 1 else "")
-        # final: full string's tail must equal after (right anchor)
+            for c in range(n):
+                left_context[c] = left_context[c] + dec[r][c] + (mids_str[j] if j < S - 1 else "")
         if after_list:
             na = len(after_list)
-            full = tokenizer([left_context[c] + after_str for c in range(S)], padding=False, add_special_tokens=True)["input_ids"]
-            for c in range(S):
+            full = tokenizer([left_context[c] + after_str for c in range(n)], padding=False, add_special_tokens=True)["input_ids"]
+            for c in range(n):
                 if ok[c] and full[c][len(full[c]) - na:] != after_list:
                     ok[c] = False
-        keep = [surviving[c] for c in range(S) if ok[c]]
+        keep = [surviving[c] for c in range(n) if ok[c]]
         surviving = torch.stack(keep) if keep else ids.new_empty((0, surviving.shape[1]))
 
     if surviving.shape[0] == 0 and raise_on_empty:
@@ -450,8 +448,10 @@ class GCG:
         self.draft_prefix_cache = None
 
         # Multi-region (K-suffix) state. optim_region_lens is the per-region
-        # token length list; when not None the run is in multi-region mode.
+        # token length list (one entry per DISTINCT region); when not None the
+        # run is in multi-region mode. _slot_regions maps slots -> region idx.
         self.optim_region_lens = None
+        self._slot_regions = None
         self._region_ctx = None
 
         self.stop_flag = False
@@ -530,12 +530,12 @@ class GCG:
         else:
             messages = copy.deepcopy(messages)
 
-        # Multi-region mode: template carries ordered `{optim_0}`..`{optim_{K-1}}`.
+        # Multi-region mode: template carries `{optim_i}` placeholders. Region i
+        # is optimized independently; a region index MAY REPEAT (the same
+        # optimized tokens appear at multiple slots — "tied" suffixes, e.g. the
+        # identical string on both MC options). Slots are ordered by appearance.
         joined = "".join(d["content"] for d in messages)
-        n_regions = 0
-        while f"{{optim_{n_regions}}}" in joined:
-            n_regions += 1
-        multi_region = n_regions > 0
+        multi_region = "{optim_" in joined and "{optim_str}" not in joined
 
         if not multi_region:
             # Append the GCG string at the end of the prompt if location not specified
@@ -551,24 +551,27 @@ class GCG:
         target = " " + target if config.add_space_before_target else target
         embedding_layer = self.embedding_layer
 
-        region_mids_str = region_mids_ids = region_mids_embeds = None
+        slot_regions = None
+        slot_mids_str = slot_mids_ids = slot_mids_embeds = None
         if multi_region:
+            import re
+            occ = list(re.finditer(r"\{optim_(\d+)\}", template))
+            if not occ:
+                raise ValueError("multi-region GCG: no `{optim_i}` placeholder found in rendered template")
+            slot_regions = [int(m.group(1)) for m in occ]          # region idx per slot (may repeat)
+            n_regions = max(slot_regions) + 1
             if config.optim_str_inits is None or len(config.optim_str_inits) != n_regions:
                 raise ValueError(
-                    f"multi-region GCG found {n_regions} `{{optim_i}}` placeholders but "
-                    f"config.optim_str_inits has {None if config.optim_str_inits is None else len(config.optim_str_inits)} entries"
+                    f"multi-region GCG found regions 0..{n_regions-1} but config.optim_str_inits has "
+                    f"{None if config.optim_str_inits is None else len(config.optim_str_inits)} entries"
                 )
-            # Split the template on the ordered placeholders into
-            # [before, mid_0, mid_1, ..., mid_{K-2}, after].
-            before_str, rest = template.split("{optim_0}")
-            region_mids_str = []
-            for i in range(1, n_regions):
-                seg, rest = rest.split(f"{{optim_{i}}}")
-                region_mids_str.append(seg)   # text between region i-1 and region i
-            after_str = rest
-            region_mids_ids = [tokenizer([s], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
-                               for s in region_mids_str]
-            region_mids_embeds = [embedding_layer(x) for x in region_mids_ids]
+            before_str = template[: occ[0].start()]
+            after_str = template[occ[-1].end():]
+            # fixed text between consecutive slots (len = n_slots - 1)
+            slot_mids_str = [template[occ[j].end(): occ[j + 1].start()] for j in range(len(occ) - 1)]
+            slot_mids_ids = [tokenizer([s], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
+                             for s in slot_mids_str]
+            slot_mids_embeds = [embedding_layer(x) for x in slot_mids_ids]
         else:
             before_str, after_str = template.split("{optim_str}")
 
@@ -631,9 +634,10 @@ class GCG:
             prefix_legacy=prefix_legacy,
             after_str=after_str,
             after_ids=after_ids,
-            region_mids_str=region_mids_str,
-            region_mids_ids=region_mids_ids,
-            region_mids_embeds=region_mids_embeds,
+            slot_regions=slot_regions,
+            slot_mids_str=slot_mids_str,
+            slot_mids_ids=slot_mids_ids,
+            slot_mids_embeds=slot_mids_embeds,
         )
 
     def _run_bundles(self, bundles: List[PromptBundle]) -> GCGResult:
@@ -674,19 +678,21 @@ class GCG:
         # the multi-region filter. The cross-bundle fast path is NOT compatible
         # with multi-region (there is fixed text between the adv slots), so it is
         # disabled below.
-        if primary.region_mids_embeds is not None:
+        if primary.slot_regions is not None:
             self.optim_region_lens = [
                 tokenizer([s], add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
                 for s in config.optim_str_inits
             ]
-            # filter needs, per bundle: before, before_ids, the K-1 mid strings, after, after_ids
+            self._slot_regions = list(primary.slot_regions)
+            # filter needs, per bundle: before, before_ids, the (n_slots-1) mid strings, after, after_ids
             self._region_ctx = [
-                (b.before_str, b.before_ids[0].tolist(), list(b.region_mids_str),
+                (b.before_str, b.before_ids[0].tolist(), list(b.slot_mids_str),
                  b.after_str, b.after_ids[0].tolist())
                 for b in bundles
             ]
         else:
             self.optim_region_lens = None
+            self._slot_regions = None
             self._region_ctx = None
 
         # Universal fast path: cross-bundle batching. Available only when every
@@ -782,7 +788,8 @@ class GCG:
                         if self.optim_region_lens is not None:
                             candidates = filter_ids_multi_region(
                                 candidates, tokenizer, self._region_ctx,
-                                self.optim_region_lens, raise_on_empty=False,
+                                self.optim_region_lens, self._slot_regions,
+                                raise_on_empty=False,
                             )
                         elif self._filter_boundary_ctx is not None:
                             candidates = filter_ids(
@@ -1101,22 +1108,25 @@ class GCG:
 
     def _optim_segments(self, optim_embeds_full: Tensor, bundle: PromptBundle) -> List[Tensor]:
         """Split the (batched) optim embeddings into the segments to splice into
-        the prompt. Single-region: `[optim]`. Multi-region: interleave the K
-        region slices with the K-1 fixed per-bundle mid segments (broadcast to
-        the batch dim): `[r0, mid0, r1, mid1, ..., r_{K-1}]`. optim_embeds_full
-        has shape [B, n_total, d].
+        the prompt. Single-region: `[optim]`. Multi-region: walk the SLOTS,
+        placing each slot's region slice (a region used by multiple slots
+        contributes the SAME slice at each — a tied suffix; autograd sums its
+        gradient across occurrences) and interleaving the fixed per-slot mid
+        segments (broadcast to the batch dim). optim_embeds_full is [B, n_total, d].
         """
         if self.optim_region_lens is None:
             return [optim_embeds_full]
         B = optim_embeds_full.shape[0]
+        # start offset of each distinct region within the concatenated optim vector
+        starts = [0]
+        for L in self.optim_region_lens:
+            starts.append(starts[-1] + L)
         segs = []
-        idx = 0
-        K = len(self.optim_region_lens)
-        for i, L in enumerate(self.optim_region_lens):
-            segs.append(optim_embeds_full[:, idx: idx + L, :])
-            idx += L
-            if i < K - 1:
-                segs.append(bundle.region_mids_embeds[i].expand(B, -1, -1))
+        S = len(self._slot_regions)
+        for j, r in enumerate(self._slot_regions):
+            segs.append(optim_embeds_full[:, starts[r]: starts[r] + self.optim_region_lens[r], :])
+            if j < S - 1:
+                segs.append(bundle.slot_mids_embeds[j].expand(B, -1, -1))
         return segs
 
     def compute_token_gradient(
